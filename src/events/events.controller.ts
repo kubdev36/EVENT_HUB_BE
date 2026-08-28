@@ -1,0 +1,54 @@
+import { Body, Controller, Get, Post, Query, UseGuards } from '@nestjs/common';
+import { ApiBearerAuth, ApiBody, ApiOperation, ApiQuery, ApiTags } from '@nestjs/swagger';
+import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
+import { RolesGuard } from '../auth/guards/roles.guard';
+import { Roles } from '../auth/decorators/roles.decorator';
+import { Role } from '../auth/enums/role.enum';
+import { CreateEventDto } from './dto/create-event.dto';
+import { EventsService } from './events.service';
+
+@ApiTags('events')
+@ApiBearerAuth()
+@Controller('events')
+@UseGuards(JwtAuthGuard, RolesGuard)
+export class EventsController {
+  constructor(private readonly eventsService: EventsService) {}
+
+  @Get()
+  @Roles(Role.ADMIN, Role.STAFF)
+  @ApiOperation({ summary: 'List latest events' })
+  @ApiQuery({ name: 'limit', required: false, type: Number })
+  async findAll(@Query('limit') limit?: string) {
+    return this.eventsService.findLatest(limit ? Number(limit) : 50);
+  }
+
+  @Get('latest')
+  @Roles(Role.ADMIN, Role.STAFF)
+  @ApiOperation({ summary: 'List latest events with smaller default limit' })
+  @ApiQuery({ name: 'limit', required: false, type: Number })
+  async findLatest(@Query('limit') limit?: string) {
+    return this.eventsService.findLatest(limit ? Number(limit) : 20);
+  }
+
+  @Post()
+  @Roles(Role.ADMIN, Role.STAFF)
+  @ApiOperation({ summary: 'Create manual event' })
+  @ApiBody({
+    schema: {
+      type: 'object',
+      required: ['type', 'title'],
+      properties: {
+        type: { type: 'string', example: 'release' },
+        title: { type: 'string', example: 'Samsung ra mat Galaxy S26' },
+        description: { type: 'string', example: 'Su kien ra mat san pham moi' },
+        eventDate: { type: 'string', example: '2026-08-28T14:00:00.000Z' },
+        eventTime: { type: 'string', example: '14:00' },
+        image: { type: 'string', example: 'https://example.com/image.jpg' },
+        url: { type: 'string', example: 'https://example.com/event' },
+      },
+    },
+  })
+  async create(@Body() body: CreateEventDto) {
+    return this.eventsService.createManualEvent(body);
+  }
+}
