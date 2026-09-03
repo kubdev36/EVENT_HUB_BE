@@ -30,6 +30,31 @@ export class EventsController {
     return this.eventsService.findLatest(limit ? Number(limit) : 20);
   }
 
+  @Get('overview')
+  @Roles(Role.ADMIN, Role.STAFF)
+  @ApiOperation({ summary: 'Get overview data for FE' })
+  @ApiQuery({ name: 'limit', required: false, type: Number })
+  async getOverviewData(@Query('limit') limit?: string) {
+    return this.eventsService.getDashboardData(limit ? Number(limit) : 500);
+  }
+
+  @Get('dashboard')
+  @Roles(Role.ADMIN, Role.STAFF)
+  @ApiOperation({ summary: 'Alias for overview data' })
+  @ApiQuery({ name: 'limit', required: false, type: Number })
+  async getDashboardData(@Query('limit') limit?: string) {
+    return this.eventsService.getDashboardData(limit ? Number(limit) : 500);
+  }
+
+  @Get('by-date')
+  @Roles(Role.ADMIN, Role.STAFF)
+  @ApiOperation({ summary: 'Get events by date' })
+  @ApiQuery({ name: 'date', required: false, type: String })
+  @ApiQuery({ name: 'limit', required: false, type: Number })
+  async getEventsByDate(@Query('date') date?: string, @Query('limit') limit?: string) {
+    return this.eventsService.getEventsByDate(date, limit ? Number(limit) : 500);
+  }
+
   @Post()
   @Roles(Role.ADMIN, Role.STAFF)
   @ApiOperation({ summary: 'Create manual event' })

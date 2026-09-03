@@ -21,23 +21,36 @@ export class ClassifierService {
       }
     }
 
-    if (text.includes('sale') || text.includes('giam gia') || text.includes('uu dai') || text.includes('khuyen mai')) {
-      return 'sale';
+    if (
+      text.includes('sale') ||
+      text.includes('giam gia') ||
+      text.includes('uu dai') ||
+      text.includes('khuyen mai') ||
+      text.includes('deal') ||
+      text.includes('gia soc')
+    ) {
+      return 'promo';
     }
 
-    if (text.includes('ra mat') || text.includes('mo ban') || text.includes('pre-order') || text.includes('launch')) {
-      return 'release';
-    }
-
-    if (text.includes('livestream') || text.includes('live stream')) {
-      return 'livestream';
+    if (text.includes('livestream') || text.includes('live stream') || text.includes('live')) {
+      return 'live';
     }
 
     if (text.includes('quang cao') || text.includes('campaign') || text.includes('ads') || text.includes('advert')) {
       return 'ads';
     }
 
-    return 'other';
+    if (
+      text.includes('ra mat') ||
+      text.includes('mo ban') ||
+      text.includes('pre-order') ||
+      text.includes('launch') ||
+      text.includes('chinh thuc')
+    ) {
+      return 'release';
+    }
+
+    return 'promo';
   }
 
   private normalize(value: string) {
@@ -55,11 +68,12 @@ export class ClassifierService {
     const value = this.normalize(type);
 
     if (['release', 'launch', 'ra mat', 'mo ban'].includes(value)) return 'release';
-    if (['sale', 'promotion', 'khuyen mai', 'uu dai'].includes(value)) return 'sale';
-    if (['livestream', 'live', 'live stream'].includes(value)) return 'livestream';
+    if (['sale', 'promo', 'promotion', 'khuyen mai', 'uu dai'].includes(value)) return 'promo';
+    if (['livestream', 'live', 'live stream'].includes(value)) return 'live';
     if (['ads', 'advert', 'quang cao', 'campaign'].includes(value)) return 'ads';
+    if (['internal', 'noi bo'].includes(value)) return 'internal';
     if (['other', 'khac'].includes(value)) return 'other';
 
-    return value || 'other';
+    return value || 'promo';
   }
 }

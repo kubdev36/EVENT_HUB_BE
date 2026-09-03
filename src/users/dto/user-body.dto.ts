@@ -16,4 +16,9 @@ export class UserBodyDto {
   @IsOptional()
   @IsString()
   role?: string;
+
+  @ApiProperty({ example: 'MKT', required: false })
+  @IsOptional()
+  @IsString()
+  department?: string;
 }

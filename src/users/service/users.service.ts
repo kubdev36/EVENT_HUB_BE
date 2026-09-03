@@ -15,7 +15,7 @@ export class UsersService {
   async findAll() {
     return this.userRepository
       .createQueryBuilder('user')
-      .select(['user.id', 'user.email', 'user.role', 'user.isActive', 'user.createdAt', 'user.updatedAt'])
+      .select(['user.id', 'user.email', 'user.role', 'user.department', 'user.isActive', 'user.createdAt', 'user.updatedAt'])
       .orderBy('user.createdAt', 'DESC')
       .getMany();
   }
@@ -33,6 +33,7 @@ export class UsersService {
       email,
       password: hashedPassword,
       role: dto.role?.toLowerCase() === 'admin' ? Role.ADMIN : Role.STAFF,
+      department: dto.department || 'MKT',
     });
 
     return this.userRepository.save(user);
@@ -44,6 +45,10 @@ export class UsersService {
 
     if (dto.role) {
       user.role = dto.role.toLowerCase() === 'admin' ? Role.ADMIN : Role.STAFF;
+    }
+
+    if (dto.department) {
+      user.department = dto.department;
     }
 
     if (dto.password && !String(dto.password).includes('•')) {

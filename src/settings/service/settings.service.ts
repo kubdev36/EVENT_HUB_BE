@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable, NotFoundException, OnModuleInit } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { CrawlSource, CrawlTarget } from '../../crawlers/crawler.types';
@@ -9,12 +9,145 @@ type CrawlerSourcesSetting =
   | { targets?: Array<Record<string, unknown>>; sources?: Array<Record<string, unknown>> }
   | Array<Record<string, unknown>>;
 
+const DEFAULT_CRAWLER_SOURCES = [
+  {
+    id: 'minhtuan',
+    name: 'Minh Tuấn Mobile',
+    type: 'web',
+    logo: '/img/mtm.jpg',
+    enabled: true,
+    interval: '6h',
+    targetUrls: ['https://minhtuanmobile.com/tin-tuc/khuyen-mai/'],
+  },
+  {
+    id: 'cellphones',
+    name: 'CellphoneS',
+    type: 'web',
+    logo: '/img/cellphones.png',
+    enabled: true,
+    interval: '6h',
+    targetUrls: ['https://cellphones.com.vn/sforum/khuyen-mai-soc'],
+  },
+  {
+    id: 'hoangha',
+    name: 'Hoàng Hà Mobile',
+    type: 'web',
+    logo: '/img/hoangha.jpg',
+    enabled: true,
+    interval: '6h',
+    targetUrls: ['https://hoanghamobile.com/tin-tuc/category/khuyen-mai/'],
+  },
+  {
+    id: 'fptshop',
+    name: 'FPT Shop',
+    type: 'web',
+    logo: '/img/fpt.png',
+    enabled: true,
+    interval: '6h',
+    targetUrls: [
+      'https://fptshop.com.vn/tin-tuc/tin-khuyen-mai',
+      'https://fptshop.com.vn/tin-tuc/tin-moi',
+      'https://fptshop.com.vn/tin-tuc/danh-gia',
+      'https://fptshop.com.vn/tin-tuc/dien-may',
+      'https://fptshop.com.vn/tin-tuc/tin-fstudio',
+    ],
+  },
+  {
+    id: 'tgdd',
+    name: 'Thế Giới Di Động',
+    type: 'web',
+    logo: '/img/tgdd.jpg',
+    enabled: true,
+    interval: '6h',
+    targetUrls: [
+      'https://www.thegioididong.com/tin-tuc',
+      'https://www.thegioididong.com/tin-tuc/tin-khuyen-mai/31',
+      'https://www.thegioididong.com/tin-tuc/danh-gia/210',
+      'https://www.thegioididong.com/tin-tuc/laptop/1269',
+    ],
+  },
+  {
+    id: 'nguyenkim',
+    name: 'Nguyễn Kim',
+    type: 'web',
+    logo: '/img/nguyenkim.png',
+    enabled: true,
+    interval: '6h',
+    targetUrls: ['https://www.nguyenkim.com/khuyen-mai.html'],
+  },
+];
+
+const DEFAULT_KEYWORD_RULES = [
+  { type: 'promo', label: 'Khuyến mãi', keywords: 'khuyen mai, uu dai, giam gia, flash sale, khuyen mai soc, giam gia khung' },
+  { type: 'release', label: 'Ra mắt sản phẩm', keywords: 'ra mat, mo ban, launch, unbox, gioi thieu, san pham moi, pre-order' },
+  { type: 'live', label: 'Livestream', keywords: 'livestream, live, phat truc tiep, xem live, san deal live' },
+  { type: 'ads', label: 'Quảng cáo', keywords: 'quang cao, ads, banner, truyen thong, partner' },
+  { type: 'internal', label: 'Sự kiện nội bộ', keywords: 'noi bo, minhtuanmobile, event noi bo, mtm' },
+];
+
 @Injectable()
-export class SettingsService {
+export class SettingsService implements OnModuleInit {
   constructor(
     @InjectRepository(Setting)
     private readonly settingRepository: Repository<Setting>,
   ) {}
+
+  async onModuleInit() {
+    await this.seedDefaults();
+  }
+
+  private async seedDefaults() {
+    try {
+      const crawlerSetting = await this.settingRepository.findOne({ where: { key: 'crawler_sources' } });
+      if (!crawlerSetting || !Array.isArray(crawlerSetting.value) || crawlerSetting.value.length === 0) {
+        await this.saveSetting('crawler_sources', DEFAULT_CRAWLER_SOURCES);
+      } else if (Array.isArray(crawlerSetting.value)) {
+        let modified = false;
+        const updated = crawlerSetting.value.map((src: any) => {
+          if (src.id === 'cellphones' && src.targetUrls?.[0] !== 'https://cellphones.com.vn/sforum/khuyen-mai-soc') {
+            modified = true;
+            return { ...src, targetUrls: ['https://cellphones.com.vn/sforum/khuyen-mai-soc'] };
+          }
+          if (src.id === 'fptshop') {
+            modified = true;
+            return {
+              ...src,
+              targetUrls: [
+                'https://fptshop.com.vn/tin-tuc/tin-khuyen-mai',
+                'https://fptshop.com.vn/tin-tuc/tin-moi',
+                'https://fptshop.com.vn/tin-tuc/danh-gia',
+                'https://fptshop.com.vn/tin-tuc/dien-may',
+                'https://fptshop.com.vn/tin-tuc/tin-fstudio',
+              ],
+            };
+          }
+          if (src.id === 'tgdd') {
+            modified = true;
+            return {
+              ...src,
+              targetUrls: [
+                'https://www.thegioididong.com/tin-tuc',
+                'https://www.thegioididong.com/tin-tuc/tin-khuyen-mai/31',
+                'https://www.thegioididong.com/tin-tuc/danh-gia/210',
+                'https://www.thegioididong.com/tin-tuc/laptop/1269',
+              ],
+            };
+          }
+          return src;
+        });
+        if (modified) {
+          await this.saveSetting('crawler_sources', updated);
+        }
+      }
+
+      const keywordSetting = await this.settingRepository.findOne({ where: { key: 'keyword_rules' } });
+      if (!keywordSetting || !Array.isArray(keywordSetting.value) || keywordSetting.value.length === 0) {
+        await this.saveSetting('keyword_rules', DEFAULT_KEYWORD_RULES);
+      }
+    } catch {
+      // Ignore initial DB connection timing errors during migrations
+    }
+  }
 
   async getAllSettings() {
     const settings = await this.settingRepository.find();

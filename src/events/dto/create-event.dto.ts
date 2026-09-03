@@ -2,14 +2,24 @@ import { ApiProperty } from '@nestjs/swagger';
 import { IsIn, IsOptional, IsString } from 'class-validator';
 
 export class CreateEventDto {
-  @ApiProperty({ example: 'release', enum: ['release', 'sale', 'livestream', 'ads', 'other'] })
+  @ApiProperty({ example: 'release', enum: ['release', 'sale', 'livestream', 'ads', 'promo', 'live', 'internal', 'other'] })
   @IsString()
-  @IsIn(['release', 'sale', 'livestream', 'ads', 'other'])
+  @IsIn(['release', 'sale', 'livestream', 'ads', 'promo', 'live', 'internal', 'other'])
   type: string;
 
   @ApiProperty({ example: 'Samsung ra mat Galaxy S26' })
   @IsString()
   title: string;
+
+  @ApiProperty({ example: 'minhtuan', required: false })
+  @IsOptional()
+  @IsString()
+  sourceId?: string;
+
+  @ApiProperty({ example: 'Minh Tuấn Mobile', required: false })
+  @IsOptional()
+  @IsString()
+  sourceName?: string;
 
   @ApiProperty({ example: 'Su kien ra mat san pham moi', required: false })
   @IsOptional()
