@@ -1,16 +1,16 @@
 import { Module } from '@nestjs/common';
 import { ScheduleModule } from '@nestjs/schedule';
 import { TypeOrmModule } from '@nestjs/typeorm';
-import { AuthModule } from '../auth/auth.module';
-import { ClassifierService } from '../classifier/classifier.service';
-import { CrawlerRun } from '../crawler-runs/entity/crawler-run.entity';
-import { CrawlerSource } from '../crawler-sources/entity/crawler-source.entity';
-import { Event } from '../events/entity/event.entity';
-import { Setting } from '../settings/entity/setting.entity';
-import { TelegramService } from '../telegram/telegram.service';
-import { CrawlerController } from './controller/crawler.controller';
-import { CrawlerCronService } from './crawler-cron.service';
-import { CrawlerService } from './service/crawler.service';
+import { AuthModule } from '../auth/auth.module.js';
+import { ClassifierService } from '../classifier/classifier.service.js';
+import { CrawlerRun } from '../crawler-runs/entity/crawler-run.entity.js';
+import { CrawlerSource } from '../crawler-sources/entity/crawler-source.entity.js';
+import { Event } from '../events/entity/event.entity.js';
+import { Setting } from '../settings/entity/setting.entity.js';
+import { TelegramService } from '../telegram/telegram.service.js';
+import { CrawlerController } from './controller/crawler.controller.js';
+import { CrawlerCronService } from './crawler-cron.service.js';
+import { CrawlerService } from './service/crawler.service.js';
 
 @Module({
   imports: [ScheduleModule.forRoot(), TypeOrmModule.forFeature([Event, CrawlerRun, CrawlerSource, Setting]), AuthModule],

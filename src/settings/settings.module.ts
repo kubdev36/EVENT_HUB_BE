@@ -1,10 +1,10 @@
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
-import { AuthModule } from '../auth/auth.module';
-import { CrawlersModule } from '../crawlers/crawlers.module';
-import { SettingsController } from './controller/settings.controller';
-import { Setting } from './entity/setting.entity';
-import { SettingsService } from './service/settings.service';
+import { AuthModule } from '../auth/auth.module.js';
+import { CrawlersModule } from '../crawlers/crawlers.module.js';
+import { SettingsController } from './controller/settings.controller.js';
+import { Setting } from './entity/setting.entity.js';
+import { SettingsService } from './service/settings.service.js';
 
 @Module({
   imports: [TypeOrmModule.forFeature([Setting]), AuthModule, CrawlersModule],

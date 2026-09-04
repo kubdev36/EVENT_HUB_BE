@@ -4,9 +4,9 @@ import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 import * as bcrypt from 'bcrypt';
 import { Repository } from 'typeorm';
-import { LoginDto } from '../dto/login.dto';
-import { User } from '../entity/user.entity';
-import { Role } from '../enums/role.enum';
+import { LoginDto } from '../dto/login.dto.js';
+import { User } from '../entity/user.entity.js';
+import { Role } from '../enums/role.enum.js';
 
 @Injectable()
 export class AuthService implements OnModuleInit {

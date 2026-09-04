@@ -1,15 +1,15 @@
 import { Body, Controller, Get, Param, Post, UseGuards } from '@nestjs/common';
 import { ApiBearerAuth, ApiBody, ApiOperation, ApiParam, ApiTags } from '@nestjs/swagger';
-import { JwtAuthGuard } from '../../auth/guards/jwt-auth.guard';
-import { RolesGuard } from '../../auth/guards/roles.guard';
-import { Role } from '../../auth/enums/role.enum';
-import { Roles } from '../../auth/decorators/roles.decorator';
-import { CrawlerService } from '../../crawlers/service/crawler.service';
-import { SaveCrawlerSourcesDto } from '../dto/crawler-sources.dto';
-import { SaveKeywordRulesDto } from '../dto/keyword-rules.dto';
-import { RunCrawlerDto } from '../dto/run-crawler.dto';
-import { TelegramConfigDto } from '../dto/telegram-config.dto';
-import { SettingsService } from '../service/settings.service';
+import { JwtAuthGuard } from '../../auth/guards/jwt-auth.guard.js';
+import { RolesGuard } from '../../auth/guards/roles.guard.js';
+import { Role } from '../../auth/enums/role.enum.js';
+import { Roles } from '../../auth/decorators/roles.decorator.js';
+import { CrawlerService } from '../../crawlers/service/crawler.service.js';
+import { SaveCrawlerSourcesDto } from '../dto/crawler-sources.dto.js';
+import { SaveKeywordRulesDto } from '../dto/keyword-rules.dto.js';
+import { RunCrawlerDto } from '../dto/run-crawler.dto.js';
+import { TelegramConfigDto } from '../dto/telegram-config.dto.js';
+import { SettingsService } from '../service/settings.service.js';
 
 @ApiTags('settings')
 @ApiBearerAuth()

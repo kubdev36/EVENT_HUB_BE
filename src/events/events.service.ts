@@ -1,9 +1,9 @@
 import { Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
-import { CreateEventDto } from './dto/create-event.dto';
-import { Event } from './entity/event.entity';
-import { Setting } from '../settings/entity/setting.entity';
+import { CreateEventDto } from './dto/create-event.dto.js';
+import { Event } from './entity/event.entity.js';
+import { Setting } from '../settings/entity/setting.entity.js';
 
 @Injectable()
 export class EventsService {

@@ -1,8 +1,8 @@
 import { Injectable, NotFoundException, OnModuleInit } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
-import { CrawlSource, CrawlTarget } from '../../crawlers/crawler.types';
-import { Setting } from '../entity/setting.entity';
+import { CrawlSource, CrawlTarget } from '../../crawlers/crawler.types.js';
+import { Setting } from '../entity/setting.entity.js';
 
 type SettingsKey = 'crawler_sources' | 'telegram_config' | 'keyword_rules';
 type CrawlerSourcesSetting =

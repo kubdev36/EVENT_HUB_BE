@@ -6,12 +6,12 @@ import { createHash } from 'crypto';
 import * as http from 'http';
 import * as https from 'https';
 import { Repository } from 'typeorm';
-import { ClassifierService } from '../../classifier/classifier.service';
-import { CrawlerRun } from '../../crawler-runs/entity/crawler-run.entity';
-import { Event } from '../../events/entity/event.entity';
-import { Setting } from '../../settings/entity/setting.entity';
-import { TelegramService } from '../../telegram/telegram.service';
-import { CrawlSource, CrawlTarget, KeywordRule, ParsedCrawlItem } from '../crawler.types';
+import { ClassifierService } from '../../classifier/classifier.service.js';
+import { CrawlerRun } from '../../crawler-runs/entity/crawler-run.entity.js';
+import { Event } from '../../events/entity/event.entity.js';
+import { Setting } from '../../settings/entity/setting.entity.js';
+import { TelegramService } from '../../telegram/telegram.service.js';
+import { CrawlSource, CrawlTarget, KeywordRule, ParsedCrawlItem } from '../crawler.types.js';
 
 @Injectable()
 export class CrawlerService {

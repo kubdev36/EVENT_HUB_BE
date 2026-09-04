@@ -1,13 +1,13 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
-import { AppController } from './app.controller';
-import { AppService } from './app.service';
-import { AuthModule } from './auth/auth.module';
-import { CrawlersModule } from './crawlers/crawlers.module';
-import { EventsModule } from './events/events.module';
-import { SettingsModule } from './settings/settings.module';
-import { UsersModule } from './users/users.module';
+import { AppController } from './app.controller.js';
+import { AppService } from './app.service.js';
+import { AuthModule } from './auth/auth.module.js';
+import { CrawlersModule } from './crawlers/crawlers.module.js';
+import { EventsModule } from './events/events.module.js';
+import { SettingsModule } from './settings/settings.module.js';
+import { UsersModule } from './users/users.module.js';
 
 @Module({
   imports: [
