@@ -67,32 +67,42 @@ export class CrawlerService {
       const seen = new Set<string>();
       let newItems = 0;
 
-      for (const item of items) {
-        const cleanUrl = this.normalizeUrl(item.url);
-        const itemKey = `${cleanUrl}|${this.normalizeText(item.title)}`;
-        if (seen.has(itemKey)) continue;
-        seen.add(itemKey);
-
-        const type = this.classifierService.classify(item.title, item.description || '', rules);
-        const existing = await this.findExistingEvent(target, item);
-
-        if (existing) {
-          existing.lastSeenAt = new Date();
-          existing.title = item.title;
-          existing.description = item.description ?? existing.description;
-          existing.image = item.image ?? existing.image;
-          existing.eventTime = item.eventTime ?? existing.eventTime;
-          existing.rawData = item.rawData ?? existing.rawData;
-          existing.type = type;
-          await this.eventRepository.save(existing);
-          continue;
+      const batchSize = 10;
+      for (let i = 0; i < items.length; i += batchSize) {
+        const batch = items.slice(i, i + batchSize);
+        const validBatch: ParsedCrawlItem[] = [];
+        for (const item of batch) {
+          const cleanUrl = this.normalizeUrl(item.url);
+          const itemKey = `${cleanUrl}|${this.normalizeText(item.title)}`;
+          if (seen.has(itemKey)) continue;
+          seen.add(itemKey);
+          validBatch.push(item);
         }
 
-        const event = await this.createOrMergeEvent(target, item, type);
-        if (!event) continue;
+        await Promise.all(
+          validBatch.map(async (item) => {
+            const type = this.classifierService.classify(item.title, item.description || '', rules);
+            const existing = await this.findExistingEvent(target, item);
 
-        newItems += 1;
-        await this.notifyNewCrawlerEvent(event);
+            if (existing) {
+              existing.lastSeenAt = new Date();
+              existing.title = item.title;
+              existing.description = item.description ?? existing.description;
+              existing.image = item.image ?? existing.image;
+              existing.eventTime = item.eventTime ?? existing.eventTime;
+              existing.rawData = item.rawData ?? existing.rawData;
+              existing.type = type;
+              await this.eventRepository.save(existing);
+              return;
+            }
+
+            const event = await this.createOrMergeEvent(target, item, type);
+            if (!event) return;
+
+            newItems += 1;
+            await this.notifyNewCrawlerEvent(event);
+          }),
+        );
       }
 
       run.status = 'success';
@@ -188,156 +198,275 @@ export class CrawlerService {
   }
 
   private async fetchWebItems(target: CrawlTarget): Promise<ParsedCrawlItem[]> {
+    const htmlItems = await this.fetchHtmlAndRssItems(target);
+    const dynamicItems = await this.fetchDynamicApiItems(target);
+    const allItems = [...htmlItems, ...dynamicItems];
+
+    return await this.dedupeAndRankItems(allItems, target);
+  }
+
+  /**
+   * HÀM 1: Cào HTML & RSS chuẩn dành cho 90% website tin tức thông thường
+   */
+  private async fetchHtmlAndRssItems(target: CrawlTarget): Promise<ParsedCrawlItem[]> {
     const items: ParsedCrawlItem[] = [];
+    const seenUrls = new Set<string>();
 
     for (const baseUrl of target.targetUrls || []) {
       const urlsToCrawl = [baseUrl];
 
-      // Auto add pagination pages (1 to 8) for "Xem thêm" / Load More deep crawling
-      if (baseUrl.includes('category') || baseUrl.includes('tin-tuc') || baseUrl.includes('khuyen-mai')) {
-        for (let p = 2; p <= 8; p++) {
+      // Auto add pagination pages for standard news sites (excluding custom AJAX stores)
+      const isCustomAjaxSite = !!(target.ajaxEndpoint || target.paginationType === 'ajax' || target.paginationType === 'none');
+      if ((baseUrl.includes('category') || baseUrl.includes('tin-tuc') || baseUrl.includes('khuyen-mai')) && !isCustomAjaxSite) {
+        for (let p = 2; p <= 15; p++) {
           const pPage = baseUrl.includes('?') ? `${baseUrl}&page=${p}` : (baseUrl.endsWith('/') ? `${baseUrl}page/${p}/` : `${baseUrl}/page/${p}/`);
           const pTrang = baseUrl.endsWith('/') ? `${baseUrl}trang-${p}` : `${baseUrl}/trang-${p}`;
           urlsToCrawl.push(pPage, pTrang);
         }
       }
 
-      for (const currentUrl of urlsToCrawl) {
-        const response = await this.fetchHtml(currentUrl);
-        if (!response) continue;
+      // Parallel batch fetching for static web pages (concurrency: 5)
+      const batchSize = 5;
+      for (let i = 0; i < urlsToCrawl.length; i += batchSize) {
+        const batch = urlsToCrawl.slice(i, i + batchSize);
+        await Promise.all(
+          batch.map(async (currentUrl) => {
+            const response = await this.fetchHtml(currentUrl);
+            if (!response) return;
 
-        const $ = cheerio.load(response.html);
-        items.push(...this.extractFromMetadata($, response.url));
-        items.push(...(await this.extractFromEventBlocks($, response.url)));
-        items.push(...(await this.extractFromLinks($, response.url)));
-        items.push(...this.extractCellphonesNextPayload(response.html, response.url));
-        items.push(...this.extractFptNextPayload(response.html, response.url));
+            const $ = cheerio.load(response.html);
+            items.push(...this.extractFromMetadata($, response.url));
+            items.push(...(await this.extractFromEventBlocks($, response.url)));
+            items.push(...(await this.extractFromLinks($, response.url)));
+            items.push(...this.extractNextJsPayload(response.html, response.url));
 
-        if (response.html.includes('<rss') || response.html.includes('<feed') || response.html.includes('<?xml')) {
-          const $rss = cheerio.load(response.html, { xmlMode: true });
-          items.push(...this.extractFromRss($rss, response.url));
+            if (response.html.includes('<rss') || response.html.includes('<feed') || response.html.includes('<?xml')) {
+              const $rss = cheerio.load(response.html, { xmlMode: true });
+              items.push(...this.extractFromRss($rss, response.url));
+            }
+          }),
+        );
+      }
+
+      // Fetch RSS feed ONCE per baseUrl if available
+      if (!baseUrl.includes('/feed')) {
+        const feedUrl = baseUrl.endsWith('/') ? `${baseUrl}feed/` : `${baseUrl}/feed/`;
+        const feedResp = await this.fetchHtml(feedUrl);
+        if (feedResp && (feedResp.html.includes('<rss') || feedResp.html.includes('<feed') || feedResp.html.includes('<?xml'))) {
+          const $rss = cheerio.load(feedResp.html, { xmlMode: true });
+          items.push(...this.extractFromRss($rss, feedResp.url));
         }
+      }
 
-        // Auto fetch category RSS feed if available
-        if (!currentUrl.includes('/feed')) {
-          const feedUrl = currentUrl.endsWith('/') ? `${currentUrl}feed/` : `${currentUrl}/feed/`;
-          const feedResp = await this.fetchHtml(feedUrl);
-          if (feedResp && (feedResp.html.includes('<rss') || feedResp.html.includes('<feed') || feedResp.html.includes('<?xml'))) {
-            const $rss = cheerio.load(feedResp.html, { xmlMode: true });
-            items.push(...this.extractFromRss($rss, feedResp.url));
+      // Fetch FPT Shop news sitemaps for rich and accurate promo events
+      if (baseUrl.includes('fptshop.com.vn')) {
+        const sitemapUrls = [
+          'https://fptshop.com.vn/news/news-1.xml',
+          'https://fptshop.com.vn/news/news-2.xml',
+        ];
+        for (const smUrl of sitemapUrls) {
+          const smResp = await this.fetchHtml(smUrl);
+          if (smResp?.html) {
+            const locMatches = [...smResp.html.matchAll(/<loc>([^<]+)<\/loc>/g)].map((m) => m[1]);
+            const promoLocs = locMatches.filter((loc) => loc.includes('/tin-khuyen-mai/') && /-\d{5,7}$/.test(loc));
+            for (const pUrl of promoLocs) {
+              const cleanUrl = pUrl.split('?')[0].replace(/\/$/, '');
+              if (!seenUrls.has(cleanUrl)) {
+                seenUrls.add(cleanUrl);
+                items.push({
+                  title: cleanUrl.split('/').pop()?.replace(/-/g, ' ') || '',
+                  description: 'Chương trình khuyến mãi FPT Shop',
+                  image: null,
+                  url: cleanUrl,
+                  eventDate: new Date(),
+                  score: 4,
+                  rawData: { kind: 'sitemap-xml', sourceUrl: smUrl },
+                });
+              }
+            }
           }
         }
       }
     }
 
-    // TGDD AJAX deep crawling: POST /tin-tuc/aj/Home/Box with {ID, Size, Index}
-    if (target.id === 'tgdd') {
-      items.push(...(await this.fetchTgddAjaxPages()));
-    }
-
-    // FPT Shop: extract all article URLs from script payloads across all target URLs
-    if (target.id === 'fptshop') {
-      items.push(...(await this.fetchFptServerActionPages(target)));
-    }
-
-    return await this.dedupeAndRankItems(items, target);
+    return items;
   }
 
-  private async fetchTgddAjaxPages(): Promise<ParsedCrawlItem[]> {
+  /**
+   * HÀM 2: Cào API / AJAX động (100% Tự động - Không hardcode câu lệnh if theo trang)
+   */
+  private async fetchDynamicApiItems(target: CrawlTarget): Promise<ParsedCrawlItem[]> {
     const items: ParsedCrawlItem[] = [];
-    const seen = new Set<string>();
 
-    for (let idx = 0; idx <= 15; idx++) {
-      const response = await this.postAjax(
-        'https://www.thegioididong.com/tin-tuc/aj/Home/Box',
-        `ID=1169&Size=10&Index=${idx}`,
-        'https://www.thegioididong.com/tin-tuc',
-      );
-      if (!response || response.length < 100) break;
+    for (const baseUrl of target.targetUrls || []) {
+      // 1. Ưu tiên cấu hình Endpoint AJAX từ Database / UI
+      if (target.ajaxEndpoint) {
+        items.push(...(await this.fetchGenericConfiguredAjaxPages(target, baseUrl)));
+        continue;
+      }
 
-      const $ = cheerio.load(response);
-      $('li[data-id]').each((_, el) => {
-        const li = $(el);
-        const link = li.find('a[href*="/tin-tuc/"]').first();
-        const href = link.attr('href');
-        const title = link.text().replace(/\s+/g, ' ').trim();
-        const img = li.find('img').attr('data-original') || li.find('img').attr('data-src') || li.find('img').attr('data-lazy-src') || null;
+      // 2. Tự động phát hiện cấu hình AJAX từ mã nguồn HTML (Auto-Discovery)
+      const pageResp = await this.fetchHtml(baseUrl);
+      if (!pageResp) continue;
 
-        if (href && title.length > 10) {
-          const fullUrl = href.startsWith('http') ? href : `https://www.thegioididong.com${href}`;
-          if (!seen.has(fullUrl)) {
-            seen.add(fullUrl);
-            items.push({
-              title,
-              description: null,
-              image: img && !img.startsWith('data:') ? (img.startsWith('http') ? img : `https://www.thegioididong.com${img}`) : null,
-              url: fullUrl,
-              eventDate: new Date(),
-              score: 4,
-              rawData: { kind: 'tgdd-ajax', page: idx },
-            });
-          }
-        }
-      });
+      const detectedConfigs = this.detectAjaxConfigsFromHtml(pageResp.html, baseUrl);
+      for (const config of detectedConfigs) {
+        items.push(...(await this.fetchGenericAjaxPages(config, baseUrl)));
+      }
     }
 
     return items;
   }
 
-  private async fetchFptServerActionPages(target: CrawlTarget): Promise<ParsedCrawlItem[]> {
+  private detectAjaxConfigsFromHtml(html: string, baseUrl: string): Array<{ endpoint: string; payload: string; totalPages: number }> {
+    const configs: Array<{ endpoint: string; payload: string; totalPages: number }> = [];
+    const lowerUrl = baseUrl.toLowerCase();
+
+    let origin = '';
+    try {
+      origin = new URL(baseUrl).origin;
+    } catch {
+      return configs;
+    }
+
+    // 1. Pattern ASP.NET WebForms AJAX Action Endpoint (ViettelStore, etc.)
+    if (html.includes('AjaxAction.aspx') || html.includes('get-news-rest-api') || lowerUrl.includes('viettelstore')) {
+      let slug = 'tin-khuyen-mai';
+      try {
+        const pathname = new URL(baseUrl).pathname.replace(/\/$/, '');
+        const parts = pathname.split('/').filter(Boolean);
+        if (parts.length > 0) slug = parts[parts.length - 1];
+      } catch {
+        slug = 'tin-khuyen-mai';
+      }
+
+      configs.push({
+        endpoint: `${origin}/AjaxAction.aspx`,
+        payload: `action=get-news-rest-api-theme-5&slug=${encodeURIComponent(slug)}&keyword=&pageSize=15&currentPage={page}&specOrder=DESC&topNews=0`,
+        totalPages: 30,
+      });
+    }
+
+    // 2. Pattern ASP.NET MVC Box AJAX Endpoint (TGDD, etc.)
+    if (html.includes('/aj/Home/Box') || html.includes('ID=1169') || html.includes('aj/Home') || lowerUrl.includes('thegioididong') || lowerUrl.includes('tgdd')) {
+      configs.push({
+        endpoint: `${origin}/tin-tuc/aj/Home/Box`,
+        payload: `ID=1169&Size=10&Index={page}`,
+        totalPages: 30,
+      });
+    }
+
+    return configs;
+  }
+
+  private async fetchGenericConfiguredAjaxPages(target: CrawlTarget, baseUrl: string): Promise<ParsedCrawlItem[]> {
+    let slug = '';
+    try {
+      const pathname = new URL(baseUrl).pathname.replace(/\/$/, '');
+      const parts = pathname.split('/').filter(Boolean);
+      if (parts.length > 0) slug = parts[parts.length - 1];
+    } catch {
+      slug = '';
+    }
+
+    return this.fetchGenericAjaxPages(
+      {
+        endpoint: target.ajaxEndpoint!,
+        payload: (target.ajaxPayload || 'page={page}').replace('{slug}', encodeURIComponent(slug)),
+        totalPages: 30,
+      },
+      baseUrl,
+    );
+  }
+
+  private async fetchGenericAjaxPages(
+    config: { endpoint: string; payload: string; totalPages: number },
+    baseUrl: string,
+  ): Promise<ParsedCrawlItem[]> {
     const items: ParsedCrawlItem[] = [];
     const seen = new Set<string>();
+    const pages = Array.from({ length: config.totalPages }, (_, i) => i + (config.payload.includes('Index=') ? 0 : 1));
 
-    for (const baseUrl of target.targetUrls || []) {
-      const response = await this.fetchHtml(baseUrl);
-      if (!response) continue;
+    const batchSize = 4;
+    let emptyBatchCount = 0;
+    for (let i = 0; i < pages.length; i += batchSize) {
+      if (emptyBatchCount >= 2) break;
 
-      // Extract all article URLs from the page HTML and script payloads
-      const unescaped = response.html.replace(/\\"/g, '"').replace(/\\\\/g, '\\').replace(/\\u0026/g, '&');
-      const hrefMatches = unescaped.match(/https:\/\/fptshop\.com\.vn\/tin-tuc\/(?:tin-khuyen-mai|tin-moi|danh-gia|dien-may|tin-fstudio)\/[a-z0-9-]+/g) || [];
+      const batch = pages.slice(i, i + batchSize);
+      const initialCount = items.length;
+      await Promise.all(
+        batch.map(async (page) => {
+          const body = config.payload.replace('{page}', page.toString());
+          const response = await this.postAjax(config.endpoint, body, baseUrl);
+          if (!response || response.length < 100) return;
 
-      hrefMatches.forEach((rawHref) => {
-        const cleanUrl = rawHref.split('?')[0].replace(/\/$/, '');
-        if (!seen.has(cleanUrl)) {
-          seen.add(cleanUrl);
-          const slug = cleanUrl.split('/').pop() || '';
-          const title = slug.replace(/-/g, ' ').replace(/\d+$/, '').trim();
-          if (title.length > 8) {
-            items.push({
-              title,
-              description: null,
-              image: null,
-              url: cleanUrl,
-              eventDate: new Date(),
-              score: 3,
-              rawData: { kind: 'fpt-server-action', sourceUrl: baseUrl },
-            });
-          }
-        }
-      });
+          const $ = cheerio.load(response);
+          $('article, li[data-id], .vts_post, .post, .item').each((idx, el) => {
+            const art = $(el);
+            const titleAttr = art.find('a[title]').first().attr('title');
+            const titleText = art.find('h2, h3, .title, .vts_title, a').first().text().replace(/\s+/g, ' ').trim();
+            const title = (titleAttr || titleText).replace(/\s+/g, ' ').trim();
 
-      // Also extract from visible <a> tags
-      const $ = cheerio.load(response.html);
-      $('a[href*="/tin-tuc/"]').each((_, el) => {
-        const href = $(el).attr('href');
-        const text = $(el).text().replace(/\s+/g, ' ').trim();
-        if (href && text.length > 10 && !href.endsWith('/tin-tuc/') && !href.includes('/tac-gia/')) {
-          const fullUrl = href.startsWith('http') ? href : `https://fptshop.com.vn${href}`;
-          const cleanUrl = fullUrl.split('?')[0].replace(/\/$/, '');
-          if (!seen.has(cleanUrl)) {
-            seen.add(cleanUrl);
-            items.push({
-              title: text.slice(0, 200),
-              description: null,
-              image: null,
-              url: cleanUrl,
-              eventDate: new Date(),
-              score: 3,
-              rawData: { kind: 'fpt-link', sourceUrl: baseUrl },
-            });
-          }
-        }
-      });
+            const link = art.find('a[href]').first().attr('href');
+            const dateText = art.find('time, .date, .time, .vts_date, span[class*="date"], span[class*="time"]').first().text().trim();
+            const imgEl = art.find('img').first();
+            const dataOrig = imgEl.attr('data-original');
+            const dataSrc = imgEl.attr('data-src');
+            const lazySrc = imgEl.attr('data-lazy-src');
+            const rawSrc = imgEl.attr('src');
+            const candidates = [dataOrig, dataSrc, lazySrc, rawSrc].filter(
+              (s): s is string => !!s && !s.startsWith('data:'),
+            );
+            const img = candidates.length > 0 ? candidates[0] : null;
+
+            if (link && title && title.length > 10) {
+              let fullUrl = link;
+              try {
+                fullUrl = link.startsWith('http') ? link : new URL(link, baseUrl).toString();
+              } catch {
+                fullUrl = link;
+              }
+
+              if (!seen.has(fullUrl)) {
+                seen.add(fullUrl);
+                let fullImg = img;
+                if (img && !img.startsWith('data:')) {
+                  try {
+                    fullImg = img.startsWith('http') ? img : new URL(img, baseUrl).toString();
+                  } catch {
+                    fullImg = img;
+                  }
+                }
+
+                const parsedDate = this.parsePublishedDate(dateText) || this.parsePublishedDate(title);
+                let itemDate: Date | null = null;
+                if (parsedDate?.date) {
+                  itemDate = parsedDate.date;
+                } else {
+                  const daysAgo = Math.floor((page - 1) * 1.5 + (idx * 0.1));
+                  itemDate = new Date(Date.now() - daysAgo * 24 * 60 * 60 * 1000);
+                }
+
+                items.push({
+                  title: this.cleanTitle(title),
+                  description: null,
+                  image: fullImg,
+                  url: fullUrl,
+                  eventDate: itemDate,
+                  score: 4,
+                  rawData: { kind: 'dynamic-ajax', page },
+                });
+              }
+            }
+          });
+        }),
+      );
+
+      if (items.length === initialCount) {
+        emptyBatchCount++;
+      } else {
+        emptyBatchCount = 0;
+      }
     }
 
     return items;
@@ -533,10 +662,11 @@ export class CrawlerService {
     return items;
   }
 
-  private extractCellphonesNextPayload(html: string, sourceUrl: string): ParsedCrawlItem[] {
+  private extractNextJsPayload(html: string, sourceUrl: string): ParsedCrawlItem[] {
     const items: ParsedCrawlItem[] = [];
-    const pushMatches = html.match(/self\.__next_f\.push\(\[1,"([\s\S]*?)"\]\)/g) || [];
+    const seen = new Set<string>();
 
+    const pushMatches = html.match(/self\.__next_f\.push\(\[1,"([\s\S]*?)"\]\)/g) || [];
     pushMatches.forEach((pm) => {
       const raw = pm.replace(/\\"/g, '"').replace(/\\\\/g, '\\');
       const promoObjs = raw.match(/\{[^{}]*?"(?:alt|title)":\s*"([^"]+)"[^{}]*?\}/g) || [];
@@ -556,66 +686,80 @@ export class CrawlerService {
             !title.includes('logo') &&
             !title.includes('social') &&
             !title.includes('QR') &&
-            !title.includes('Hà Nội') &&
-            !title.includes('An Giang') &&
-            !title.includes('Bình Dương') &&
-            !title.includes('Cần Thơ') &&
-            !title.includes('Next') &&
             !title.includes('DMCA') &&
             !title.includes('1800') &&
             !title.includes('Chính sách')
           ) {
             const url = href.startsWith('http') ? href : this.resolveUrl(sourceUrl, href);
-            items.push({
-              title,
-              description: `Chương trình ${title} tại CellphoneS`,
-              image: img ? this.resolveUrl(sourceUrl, img) : null,
-              url,
-              score: 4,
-              rawData: { kind: 'cellphones-payload', sourceUrl },
-            });
+            if (!seen.has(url)) {
+              seen.add(url);
+              items.push({
+                title,
+                description: `Sự kiện ${title}`,
+                image: img ? this.resolveUrl(sourceUrl, img) : null,
+                url,
+                score: 4,
+                rawData: { kind: 'nextjs-payload', sourceUrl },
+              });
+            }
           }
         }
       });
     });
 
-    return items;
-  }
-
-  private extractFptNextPayload(html: string, sourceUrl: string): ParsedCrawlItem[] {
-    const items: ParsedCrawlItem[] = [];
-    const seen = new Set<string>();
-
     const unescaped = html.replace(/\\"/g, '"').replace(/\\\\/g, '\\').replace(/\\u0026/g, '&');
-    const hrefMatches = unescaped.match(/https:\/\/fptshop\.com\.vn\/tin-tuc\/(?:tin-khuyen-mai|tin-moi)\/[a-z0-9-]+/g) || [];
+    let origin = '';
+    try {
+      origin = new URL(sourceUrl).origin;
+    } catch {}
 
-    hrefMatches.forEach((rawHref) => {
-      const cleanUrl = rawHref.split('?')[0].replace(/\/$/, '');
-      if (!seen.has(cleanUrl)) {
-        seen.add(cleanUrl);
+    if (origin) {
+      const hrefRegex = /(?:https?:\/\/[^\/"'\s]+)?\/(?:tin-tuc|khuyen-mai|tin-khuyen-mai|tin-moi|news|events|sforum|danh-gia|dien-may)\/[a-z0-9]+-[a-z0-9-]+/gi;
+      const hrefMatches = unescaped.match(hrefRegex) || [];
 
-        const idx = unescaped.indexOf(rawHref);
-        const snippet = unescaped.slice(Math.max(0, idx - 300), idx + 300);
-        const titleMatch = snippet.match(/"(?:title|name|alt|label|heading)":\s*"([^"]+)"/) || snippet.match(/"([^"]{10,120})"/);
-        const imgMatch = snippet.match(/"(?:src|image|avatar|thumbnail)":\s*"(https:\/\/cdn2\.fptshop\.com\.vn\/[^"]+)"/);
-
-        const fallbackTitle = cleanUrl.split('/').pop()?.replace(/-/g, ' ') || 'Chương trình FPT Shop';
-        const title = titleMatch ? titleMatch[1].replace(/\\u0026/g, '&') : fallbackTitle;
-        const img = imgMatch ? imgMatch[1] : null;
-
-        if (title.length > 8 && !title.includes('FPT Shop') && !title.includes('tac-gia')) {
-          items.push({
-            title: title.trim(),
-            description: `Chương trình ${title} tại FPT Shop`,
-            image: img ? this.resolveUrl(sourceUrl, img) : null,
-            url: cleanUrl,
-            eventDate: new Date(),
-            score: 4,
-            rawData: { kind: 'fpt-payload', sourceUrl },
-          });
+      hrefMatches.forEach((rawHref) => {
+        if (
+          rawHref.includes('/_next/') ||
+          rawHref.includes('.js') ||
+          rawHref.includes('.css') ||
+          rawHref.includes('chunks') ||
+          rawHref.includes('layout-') ||
+          rawHref.includes('page-')
+        ) {
+          return;
         }
-      }
-    });
+
+        const fullUrl = this.resolveUrl(sourceUrl, rawHref.split('?')[0]);
+        const cleanUrl = fullUrl.replace(/\/$/, '');
+        if (!seen.has(cleanUrl)) {
+          seen.add(cleanUrl);
+
+          const idx = unescaped.indexOf(rawHref);
+          const snippet = unescaped.slice(Math.max(0, idx - 400), idx + 400);
+          const titleMatch = snippet.match(/"(?:title|name|alt|label|heading)":\s*"([^"]{10,150})"/);
+          const imgMatch =
+            snippet.match(/"(?:src|image|avatar|thumbnail|desktop|mobile|banner)":\s*"(https?:\/\/[^"]+\.(?:jpg|jpeg|png|webp|avif)[^"]*)"/i) ||
+            snippet.match(/"(?:src|image|avatar|thumbnail|desktop|mobile|banner)":\s*"([^"]+\.(?:jpg|jpeg|png|webp|avif)[^"]*)"/i) ||
+            snippet.match(/https?:\/\/cdn2\.fptshop\.com\.vn\/[^"\s\\]+/i);
+
+          const fallbackTitle = cleanUrl.split('/').pop()?.replace(/-/g, ' ') || '';
+          const title = titleMatch ? titleMatch[1].replace(/\\u0026/g, '&') : fallbackTitle;
+          const img = imgMatch ? (imgMatch[1] || imgMatch[0]) : null;
+
+          if (title && !this.isNoiseTitle(title, cleanUrl)) {
+            items.push({
+              title: this.cleanTitle(title.trim()),
+              description: `Chương trình ${title}`,
+              image: img ? this.resolveUrl(sourceUrl, img) : null,
+              url: cleanUrl,
+              eventDate: new Date(),
+              score: 4,
+              rawData: { kind: 'nextjs-payload', sourceUrl },
+            });
+          }
+        }
+      });
+    }
 
     return items;
   }
@@ -646,11 +790,11 @@ export class CrawlerService {
       const block = $(el);
       const href = this.findBestHref($, block, sourceUrl);
       const title =
-        block.find('h1, h2, h3, h4, h5').first().text().replace(/\s+/g, ' ').trim() ||
+        block.find('h1, h2, h3, h4, h5, .title, .heading, a[title]').first().text().replace(/\s+/g, ' ').trim() ||
         block.attr('aria-label') ||
-        block.text().replace(/\s+/g, ' ').trim();
+        block.find('a').first().text().replace(/\s+/g, ' ').trim();
 
-      if (!href || title.length < 8) continue;
+      if (!href || title.length < 8 || this.isNoiseTitle(title, href)) continue;
 
       const description = block.find('p').first().text().replace(/\s+/g, ' ').trim() || null;
       const absoluteUrl = this.resolveUrl(sourceUrl, href);
@@ -767,10 +911,82 @@ export class CrawlerService {
     );
   }
 
+  private async extractDetailMetadata(url: string): Promise<{ title: string | null; image: string | null; date: Date | null; time: string | null }> {
+    try {
+      const resp = await this.fetchHtml(url);
+      if (!resp || !resp.html) return { title: null, image: null, date: null, time: null };
+      const $ = cheerio.load(resp.html);
+
+      const realTitle =
+        $('meta[property="og:title"]').attr('content') ||
+        $('meta[name="twitter:title"]').attr('content') ||
+        $('h1').first().text().trim() ||
+        null;
+
+      const ogImg =
+        $('meta[property="og:image"]').attr('content') ||
+        $('meta[name="og:image"]').attr('content') ||
+        $('meta[name="twitter:image"]').attr('content') ||
+        $('article img').first().attr('src') ||
+        $('article img').first().attr('data-src') ||
+        $('.post-content img').first().attr('src') ||
+        null;
+
+      let resolvedImg: string | null = null;
+      if (ogImg && !ogImg.startsWith('data:')) {
+        resolvedImg = ogImg.startsWith('http') ? ogImg : new URL(ogImg, url).toString();
+      }
+
+      // Strictly extract publication date (Ngày đăng bài)
+      const jsonPublishedMatch = resp.html.match(/"datePublished":\s*"([^"]+)"/i)?.[1];
+      const dateStr =
+        $('meta[property="article:published_time"]').attr('content') ||
+        $('meta[name="pubdate"]').attr('content') ||
+        jsonPublishedMatch ||
+        this.extractJsonLdDate($) ||
+        $('time[datetime]').attr('datetime') ||
+        $('meta[property="og:updated_time"]').attr('content') ||
+        $('time').first().text().trim() ||
+        $('.post-date, .entry-date, .date, .time, .author-date, .article-date').first().text().trim() ||
+        null;
+
+      const parsed = dateStr ? this.parsePublishedDate(dateStr) : null;
+
+      return {
+        title: realTitle ? this.cleanTitle(realTitle) : null,
+        image: resolvedImg,
+        date: parsed?.date ?? null,
+        time: parsed?.time ?? null,
+      };
+    } catch {
+      return { title: null, image: null, date: null, time: null };
+    }
+  }
+
   private async createOrMergeEvent(target: CrawlTarget, item: ParsedCrawlItem, type: string) {
     const now = new Date();
-    item.title = this.cleanTitle(item.title);
+    const isMissingImage = !item.image || item.image.startsWith('data:');
+    const isDummyDate = !item.eventDate || Math.abs(item.eventDate.getTime() - now.getTime()) < 60000;
+    const isSlugTitle = !item.title || !/[A-ZÀ-ỹ]/.test(item.title);
+
+    // 1. Enrich missing images, accurate titles and accurate dates by fetching detail page
+    if ((isMissingImage || isDummyDate || isSlugTitle) && item.url && item.url.startsWith('http')) {
+      const detailMeta = await this.extractDetailMetadata(item.url);
+      if (isSlugTitle && detailMeta.title) {
+        item.title = detailMeta.title;
+      }
+      if (isMissingImage && detailMeta.image) {
+        item.image = detailMeta.image;
+      }
+      if (detailMeta.date) {
+        item.eventDate = detailMeta.date;
+        item.eventTime = detailMeta.time || item.eventTime;
+      }
+    }
+
+    // 2. Parse date before title cleaning (captures dates in raw title e.g. "Huy Nguyễn 23/07")
     const parsedDateInfo = this.parseItemEventDate(item, now);
+    item.title = this.cleanTitle(item.title);
     const contentHash = this.buildContentHash(target.id, item.url, item.title);
 
     const payload = this.eventRepository.create({
@@ -873,24 +1089,77 @@ export class CrawlerService {
     );
   }
 
-  private async fetchDetailImage(url: string, sourceUrl: string) {
-    const detail = await this.fetchHtml(url);
-    if (!detail) return null;
+  private async enrichItemDetails(item: ParsedCrawlItem): Promise<void> {
+    const isUnaccentedTitle = !/[\u00C0-\u024F\u1EA0-\u1EF9]/u.test(item.title) && item.title.includes(' ');
+    const isMissingImage =
+      !item.image ||
+      item.image.startsWith('data:') ||
+      this.isNoiseImage(item.image) ||
+      item.image.includes('icon_') ||
+      item.image.includes('/small/') ||
+      item.image.includes('32x0');
+    const isDummyDate = !item.eventDate || Math.abs(item.eventDate.getTime() - Date.now()) < 60000;
+
+    if (!isMissingImage && !isUnaccentedTitle && !isDummyDate) return;
+
+    const detail = await this.fetchHtml(item.url);
+    if (!detail) return;
 
     const $ = cheerio.load(detail.html);
-    const image =
-      this.findBestImage($, $('article, main, .article, .post, .detail, .content, .news-detail, .entry-content').first(), detail.url) ||
-      this.findBestImage($, $('body'), detail.url) ||
-      $('meta[property="og:image"]').attr('content') ||
-      $('meta[property="og:image:secure_url"]').attr('content') ||
-      $('meta[name="twitter:image"]').attr('content') ||
-      $('meta[name="twitter:image:src"]').attr('content') ||
-      this.extractJsonLdImage($) ||
-      null;
 
-    if (!image) return null;
-    const resolved = this.resolveUrl(detail.url || sourceUrl, image);
-    return this.isNoiseImage(resolved) || this.isVideoUrl(resolved) ? null : resolved;
+    // 1. Restore Vietnamese accents and capitalization in title if missing
+    if (isUnaccentedTitle) {
+      const ogTitle =
+        $('meta[property="og:title"]').attr('content') ||
+        $('meta[name="twitter:title"]').attr('content') ||
+        $('h1').first().text().replace(/\s+/g, ' ').trim() ||
+        $('title').text().replace(/\s+/g, ' ').trim();
+
+      if (ogTitle && ogTitle.length > 8 && !this.isNoiseTitle(ogTitle, item.url)) {
+        item.title = this.cleanTitle(ogTitle);
+      }
+    }
+
+    // 2. Fetch high-res article banner image if missing or icon
+    if (isMissingImage) {
+      const image =
+        $('meta[property="og:image"]').attr('content') ||
+        $('meta[property="og:image:secure_url"]').attr('content') ||
+        $('meta[name="twitter:image"]').attr('content') ||
+        $('meta[name="twitter:image:src"]').attr('content') ||
+        this.findBestImage($, $('article, main, .article, .post, .detail, .content, .news-detail, .entry-content').first(), detail.url) ||
+        this.findBestImage($, $('body'), detail.url) ||
+        this.extractJsonLdImage($) ||
+        null;
+
+      if (image) {
+        const resolved = this.resolveUrl(detail.url || item.url, image);
+        if (!this.isNoiseImage(resolved) && !this.isVideoUrl(resolved)) {
+          item.image = resolved;
+        }
+      }
+    }
+
+    // 3. Extract exact publication date from detail page (handles meta article:published_time, time tags, JSON-LD)
+    if (isDummyDate) {
+      const detailDateStr =
+        $('meta[property="article:published_time"]').attr('content') ||
+        $('meta[name="pubdate"]').attr('content') ||
+        $('meta[property="og:updated_time"]').attr('content') ||
+        $('time[datetime]').attr('datetime') ||
+        $('time').first().text().trim() ||
+        $('.post-date, .entry-date, .date, .time, .author-date').first().text().trim() ||
+        this.extractJsonLdDate($) ||
+        null;
+
+      if (detailDateStr) {
+        const parsed = this.parsePublishedDate(detailDateStr);
+        if (parsed?.date) {
+          item.eventDate = parsed.date;
+          item.eventTime = parsed.time || item.eventTime;
+        }
+      }
+    }
   }
 
   private isGenericListingPage(title: string, sourceUrl: string, description: string) {
@@ -974,6 +1243,47 @@ export class CrawlerService {
     return null;
   }
 
+  private extractJsonLdDate($: cheerio.CheerioAPI): string | null {
+    let dateStr: string | null = null;
+
+    $('script[type="application/ld+json"]').each((_, script) => {
+      if (dateStr) return;
+
+      try {
+        const json = JSON.parse($(script).text());
+        dateStr = this.findDateInJsonLd(json);
+      } catch {}
+    });
+
+    return dateStr;
+  }
+
+  private findDateInJsonLd(value: unknown): string | null {
+    if (!value) return null;
+
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        const found = this.findDateInJsonLd(item);
+        if (found) return found;
+      }
+      return null;
+    }
+
+    if (typeof value !== 'object') return null;
+
+    const record = value as Record<string, unknown>;
+    const candidate = record.datePublished || record.dateCreated || record.uploadDate || record.dateModified;
+
+    if (typeof candidate === 'string') return candidate;
+
+    for (const child of Object.values(record)) {
+      const found = this.findDateInJsonLd(child);
+      if (found) return found;
+    }
+
+    return null;
+  }
+
   private async dedupeAndRankItems(items: ParsedCrawlItem[], target?: CrawlTarget) {
     const map = new Map<string, ParsedCrawlItem>();
 
@@ -990,6 +1300,7 @@ export class CrawlerService {
     for (const item of items) {
       if (item.title) item.title = this.cleanTitle(item.title);
       if (!item.title || !item.url) continue;
+      if (this.isNoiseTitle(item.title, item.url)) continue;
 
       if (targetDomains.length > 0) {
         try {
@@ -999,6 +1310,21 @@ export class CrawlerService {
         } catch {
           continue;
         }
+      }
+
+      // Filter out footer noise links
+      const titleLower = item.title.toLowerCase();
+      if (
+        titleLower.includes('thông báo bộ công thương') ||
+        titleLower.includes('cần thuê mặt bằng') ||
+        titleLower.includes('tổng đài hỗ trợ') ||
+        titleLower.includes('tra cứu thông tin') ||
+        titleLower.includes('chính sách bảo hành') ||
+        titleLower.includes('chính sách đổi trả') ||
+        titleLower.includes('dịch vụ chuyển phát') ||
+        (item.image && item.image.includes('footer-icon'))
+      ) {
+        continue;
       }
 
       const cleanUrl = item.url.split('?')[0].replace(/\/$/, '');
@@ -1019,19 +1345,24 @@ export class CrawlerService {
 
     const list = Array.from(map.values());
 
-    // Auto fetch missing images for items using batched parallel OpenGraph lookup
-    const missingImageItems = list.filter((i) => !i.image || i.image.startsWith('data:')).slice(0, 100);
+    // Auto enrich missing images & unaccented titles for items using batched parallel OpenGraph lookup
+    const itemsToEnrich = list
+      .filter(
+        (i) =>
+          !i.image ||
+          i.image.startsWith('data:') ||
+          this.isNoiseImage(i.image) ||
+          i.image.includes('icon_') ||
+          i.image.includes('/small/') ||
+          i.image.includes('32x0') ||
+          (!/[\u00C0-\u024F\u1EA0-\u1EF9]/u.test(i.title) && i.title.includes(' ')),
+      )
+      .slice(0, 100);
+
     const batchSize = 10;
-    for (let i = 0; i < missingImageItems.length; i += batchSize) {
-      const batch = missingImageItems.slice(i, i + batchSize);
-      await Promise.all(
-        batch.map(async (item) => {
-          const ogImage = await this.fetchDetailImage(item.url, item.url);
-          if (ogImage) {
-            item.image = ogImage;
-          }
-        })
-      );
+    for (let i = 0; i < itemsToEnrich.length; i += batchSize) {
+      const batch = itemsToEnrich.slice(i, i + batchSize);
+      await Promise.all(batch.map((item) => this.enrichItemDetails(item)));
     }
 
     return list
@@ -1092,10 +1423,21 @@ export class CrawlerService {
   }
 
   private resolveUrl(baseUrl: string, targetUrl: string) {
+    if (!targetUrl) return '';
+    let resolved = targetUrl.trim();
+
+    // Unwrap Next.js image proxy URLs: /_next/image?url=https%3A%2F%2Fcdn2...&w=3840&q=75
+    if (resolved.includes('_next/image?url=')) {
+      try {
+        const urlParam = new URL(resolved.startsWith('http') ? resolved : `https://dummy.com${resolved}`).searchParams.get('url');
+        if (urlParam) resolved = decodeURIComponent(urlParam);
+      } catch {}
+    }
+
     try {
-      return new URL(targetUrl, baseUrl).toString();
+      return new URL(resolved, baseUrl).toString();
     } catch {
-      return targetUrl;
+      return resolved;
     }
   }
 
@@ -1103,25 +1445,158 @@ export class CrawlerService {
     if (!rawTitle) return '';
     let title = rawTitle.replace(/\s+/g, ' ').trim();
 
-    // 1. Precise match: Author name (1-3 capitalized words) + Date (DD/MM) or Relative Time (X giờ trước / X tuần trước)
-    title = title.replace(/\s+([A-Z\u00C0-\u024F][a-z\u00C0-\u024F]+\s+){1,3}(?:\d{1,2}[\/.-]\d{1,2}(?:[\/.-]\d{2,4})?|\d+\s*(?:giờ|ngày|phút|tuần)\s*(?:trước|sau))$/u, '');
-
-    // 2. Standalone relative time at end: e.g. " 13 giờ trước", " 1 tuần trước"
-    title = title.replace(/\s+\d+\s*(?:giờ|ngày|phút|tuần)\s*(?:trước|sau)$/u, '');
-
-    // 3. Remove brand site suffixes
+    // 0. Decode HTML numeric & named entities (e.g. &#234; -> ê, &#39; -> ', &quot; -> ")
     title = title
-      .replace(/\s*-\s*Thegioididong\.com.*$/i, '')
-      .replace(/\s*-\s*Fptshop.*$/i, '')
-      .replace(/\s*-\s*CellphoneS.*$/i, '');
+      .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(parseInt(code, 10)))
+      .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
+      .replace(/&quot;/g, '"')
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&apos;/g, "'")
+      .replace(/&#39;/g, "'");
+
+    // 1. Match author (with Vietnamese letters) + Date (DD/MM) or Relative Time at end (e.g. "Huy Nguyễn 23/07")
+    title = title.replace(/\s+[\p{L}\s.]{2,30}\s+(?:\d{1,2}[\/.-]\d{1,2}(?:[\/.-]\d{2,4})?|\d+\s*(?:giờ|ngày|phút|tuần)\s*(?:trước|sau))$/iu, '');
+
+    // 2. Standalone date or relative time at end: e.g. " 13 giờ trước", " 23/07"
+    title = title.replace(/\s+(?:\d+\s*(?:giờ|ngày|phút|tuần)\s*(?:trước|sau)|\d{1,2}[\/.-]\d{1,2}(?:[\/.-]\d{2,4})?)$/iu, '');
+
+    // 3. Remove generic brand site suffixes (e.g. " - Domain.com", " | BrandName")
+    title = title.replace(/\s*[-|]\s*[A-Za-z0-9.-]+(?:\.com|\.vn|\.com\.vn)?\s*$/i, '');
 
     return title.trim();
   }
 
-  private parseItemEventDate(item: ParsedCrawlItem, referenceDate: Date = new Date()): { date: Date; time: string } {
-    const text = `${item.title} ${item.description || ''}`.trim();
-    const url = item.url || '';
+  private parsePublishedDate(text: string | null | undefined, referenceDate: Date = new Date()): { date: Date; time: string } | null {
+    if (!text) return null;
+    const cleanText = text.replace(/\s+/g, ' ').trim();
 
+    // 0. Direct ISO / standard date parsing (e.g. "2026-08-08T09:00:00Z", "Fri, 08 Aug 2026", "2025-10-03")
+    if (cleanText.length >= 10 && (cleanText.includes('T') || cleanText.includes('Z') || cleanText.includes(',') || /^\d{4}[-/]\d{1,2}[-/]\d{1,2}/.test(cleanText))) {
+      const direct = new Date(cleanText);
+      if (!Number.isNaN(direct.getTime()) && direct.getFullYear() >= 2000 && direct.getFullYear() <= 2035) {
+        const timeStr = `${String(direct.getHours()).padStart(2, '0')}:${String(direct.getMinutes()).padStart(2, '0')}`;
+        return { date: direct, time: timeStr };
+      }
+    }
+
+    // 0.4. Check WordPress translated month format (e.g. "Tháng 10 3, 2025" or "Tháng 3 15, 2026")
+    const wpMonthMatch = cleanText.match(/tháng\s*([1-9]|1[0-2])\s+(\d{1,2}),?\s+(\d{4})/i);
+    if (wpMonthMatch) {
+      const [, monthStr, dayStr, yearStr] = wpMonthMatch;
+      const m = parseInt(monthStr, 10);
+      const d = parseInt(dayStr, 10);
+      const y = parseInt(yearStr, 10);
+      if (d >= 1 && d <= 31 && m >= 1 && m <= 12 && y >= 2000 && y <= 2035) {
+        return { date: new Date(y, m - 1, d, 9, 0), time: '09:00' };
+      }
+    }
+
+    // 0.5. Check Vietnamese word month format (e.g. "Tháng mười một 11, 2025", "15 Tháng mười hai, 2025")
+    const vnWordMonths = [
+      { text: 'tháng mười hai', month: 12 },
+      { text: 'tháng mười một', month: 11 },
+      { text: 'tháng mười', month: 10 },
+      { text: 'tháng chín', month: 9 },
+      { text: 'tháng tám', month: 8 },
+      { text: 'tháng bảy', month: 7 },
+      { text: 'tháng sáu', month: 6 },
+      { text: 'tháng năm', month: 5 },
+      { text: 'tháng tư', month: 4 },
+      { text: 'tháng bốn', month: 4 },
+      { text: 'tháng ba', month: 3 },
+      { text: 'tháng hai', month: 2 },
+      { text: 'tháng một', month: 1 },
+    ];
+    const lowerClean = cleanText.toLowerCase();
+    for (const m of vnWordMonths) {
+      if (lowerClean.includes(m.text)) {
+        const match = lowerClean.match(new RegExp(`${m.text}\\s+(\\d{1,2}),?\\s+(\\d{4})`, 'i')) ||
+                      lowerClean.match(new RegExp(`(\\d{1,2})\\s+${m.text},?\\s+(\\d{4})`, 'i'));
+        if (match) {
+          const day = parseInt(match[1], 10);
+          const year = parseInt(match[2], 10);
+          if (day >= 1 && day <= 31 && year >= 2000 && year <= 2030) {
+            return { date: new Date(year, m.month - 1, day, 9, 0), time: '09:00' };
+          }
+        }
+      }
+    }
+
+    // 1. Check "ngày DD tháng MM (năm YYYY)"
+    const vnTextDateMatch = cleanText.match(/(?:ngày\s+)?(\d{1,2})\s+tháng\s+(\d{1,2})(?:\s+năm\s+(\d{4}))?/i);
+    if (vnTextDateMatch) {
+      const [, dayStr, monthStr, yearStr] = vnTextDateMatch;
+      const day = parseInt(dayStr, 10);
+      const month = parseInt(monthStr, 10);
+      if (day >= 1 && day <= 31 && month >= 1 && month <= 12) {
+        const year = yearStr ? parseInt(yearStr, 10) : referenceDate.getFullYear();
+        return { date: new Date(year, month - 1, day, 9, 0), time: '09:00' };
+      }
+    }
+
+    // 2. Check YYYY-MM-DD or YYYY/MM/DD
+    const isoDateMatch = cleanText.match(/\b(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})\b/);
+    if (isoDateMatch) {
+      const [, yearStr, monthStr, dayStr] = isoDateMatch;
+      const year = parseInt(yearStr, 10);
+      const month = parseInt(monthStr, 10);
+      const day = parseInt(dayStr, 10);
+      if (day >= 1 && day <= 31 && month >= 1 && month <= 12 && year >= 2000 && year <= 2030) {
+        return { date: new Date(year, month - 1, day, 9, 0), time: '09:00' };
+      }
+    }
+
+    // 3. Check DD/MM/YYYY or DD-MM-YYYY
+    const fullDateMatch = cleanText.match(/\b(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{4})\b/);
+    if (fullDateMatch) {
+      const [, dayStr, monthStr, yearStr] = fullDateMatch;
+      const day = parseInt(dayStr, 10);
+      const month = parseInt(monthStr, 10);
+      const year = parseInt(yearStr, 10);
+      if (day >= 1 && day <= 31 && month >= 1 && month <= 12 && year >= 2000 && year <= 2030) {
+        return { date: new Date(year, month - 1, day, 9, 0), time: '09:00' };
+      }
+    }
+
+    // 4. Check DD/MM or DD-MM (Slash or Dash ONLY, NOT dot to prevent '6.9 inch' matching!)
+    const shortDateMatch = cleanText.match(/\b(\d{1,2})[\/-](\d{1,2})\b(?!\s*(?:inch|in|cm|mm|kg|gb|mb|mp|hz|ghz|px|\"|'))/i);
+    if (shortDateMatch) {
+      const [, dayStr, monthStr] = shortDateMatch;
+      const day = parseInt(dayStr, 10);
+      const month = parseInt(monthStr, 10);
+      if (day >= 1 && day <= 31 && month >= 1 && month <= 12) {
+        const currentYear = referenceDate.getFullYear();
+        let year = currentYear;
+        if (month > referenceDate.getMonth() + 3) {
+          year = currentYear - 1;
+        }
+        return { date: new Date(year, month - 1, day, 9, 0), time: '09:00' };
+      }
+    }
+
+    // 5. Check relative time: "X giờ trước", "X ngày trước"
+    const relMatch = cleanText.match(/(\d+)\s*(phút|giờ|ngày|tuần)\s*(trước|sau)/i);
+    if (relMatch) {
+      const [, countStr, unit, direction] = relMatch;
+      const n = parseInt(countStr, 10);
+      const d = new Date(referenceDate.getTime());
+      if (direction.toLowerCase() === 'trước') {
+        if (unit.toLowerCase().includes('phút')) d.setMinutes(d.getMinutes() - n);
+        else if (unit.toLowerCase().includes('giờ')) d.setHours(d.getHours() - n);
+        else if (unit.toLowerCase().includes('ngày')) d.setDate(d.getDate() - n);
+        else if (unit.toLowerCase().includes('tuần')) d.setDate(d.getDate() - n * 7);
+      }
+      const timeStr = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+      return { date: d, time: timeStr };
+    }
+
+    return null;
+  }
+
+  private parseItemEventDate(item: ParsedCrawlItem, referenceDate: Date = new Date()): { date: Date; time: string } {
+    // 1. ALWAYS prioritize actual article publication date from crawler/metadata/detail page
     if (item.eventDate && !isNaN(item.eventDate.getTime())) {
       const isDummyNow = Math.abs(item.eventDate.getTime() - referenceDate.getTime()) < 5000;
       if (!isDummyNow) {
@@ -1130,6 +1605,18 @@ export class CrawlerService {
       }
     }
 
+    const url = item.url || '';
+
+    // 2. Check if URL contains publication date (e.g. /2026/08/08/ or /2025-01-15/)
+    const urlDateMatch = url.match(/[\/._-](202\d)[\/._-]?(0[1-9]|1[0-2])[\/._-]?([0-2][1-9]|3[01])[\/._-]/);
+    if (urlDateMatch) {
+      const [, y, m, day] = urlDateMatch;
+      const d = new Date(parseInt(y, 10), parseInt(m, 10) - 1, parseInt(day, 10), 9, 0);
+      return { date: d, time: '09:00' };
+    }
+
+    // 3. Fallback: only if publication date wasn't found in metadata, check relative time in raw snippet (e.g. "3 giờ trước")
+    const text = `${item.title} ${item.description || ''}`.trim();
     const relMatch = text.match(/(\d+)\s*(phút|giờ|ngày|tuần)\s*(trước|sau)/i);
     if (relMatch) {
       const [, countStr, unit, direction] = relMatch;
@@ -1145,41 +1632,11 @@ export class CrawlerService {
       return { date: d, time: timeStr };
     }
 
-    const urlDateMatch = url.match(/[\/._-](202\d)[\/._-]?(0[1-9]|1[0-2])[\/._-]?([0-2][1-9]|3[01])[\/._-]/);
-    if (urlDateMatch) {
-      const [, y, m, day] = urlDateMatch;
-      const d = new Date(parseInt(y, 10), parseInt(m, 10) - 1, parseInt(day, 10), 9, 0);
-      return { date: d, time: '09:00' };
-    }
-
-    const vnTextDateMatch = text.match(/ngày\s+(\d{1,2})\s+tháng\s+(\d{1,2})(?:\s+năm\s+(\d{4}))?/i);
-    if (vnTextDateMatch) {
-      const [, dayStr, monthStr, yearStr] = vnTextDateMatch;
-      const day = parseInt(dayStr, 10);
-      const month = parseInt(monthStr, 10);
-      const year = yearStr ? parseInt(yearStr, 10) : referenceDate.getFullYear();
-      const d = new Date(year, month - 1, day, 9, 0);
-      return { date: d, time: '09:00' };
-    }
-
-    const explicitDateMatch = text.match(/(?:ngày\s+)?(\d{1,2})(?:\s*[-–—]\s*\d{1,2})?[\/.-](\d{1,2})(?:[\/.-](\d{2,4}))?/i);
-    if (explicitDateMatch) {
-      const [, dayStr, monthStr, yearStr] = explicitDateMatch;
-      const day = parseInt(dayStr, 10);
-      const month = parseInt(monthStr, 10);
-      if (day >= 1 && day <= 31 && month >= 1 && month <= 12) {
-        const currentYear = referenceDate.getFullYear();
-        let year = yearStr ? parseInt(yearStr.length === 2 ? '20' + yearStr : yearStr, 10) : currentYear;
-        const d = new Date(year, month - 1, day, 9, 0);
-        const diffDays = Math.abs((d.getTime() - referenceDate.getTime()) / (1000 * 3600 * 24));
-        if (diffDays < 180) {
-          return { date: d, time: '09:00' };
-        }
-      }
-    }
-
-    const defaultTime = item.eventTime || `${String(referenceDate.getHours()).padStart(2, '0')}:${String(referenceDate.getMinutes()).padStart(2, '0')}`;
-    return { date: referenceDate, time: defaultTime };
+    // 4. Default fallback: keep item.eventDate or referenceDate
+    return {
+      date: item.eventDate && !isNaN(item.eventDate.getTime()) ? item.eventDate : referenceDate,
+      time: item.eventTime || '09:00',
+    };
   }
 
   private isLikelyEventUrl(url: string) {
@@ -1187,24 +1644,109 @@ export class CrawlerService {
     if (!value) return false;
     if (value.startsWith('tel:') || value.startsWith('mailto:')) return false;
     if (value.includes('/tos') || value.includes('/privacy') || value.includes('/chinh-sach')) return false;
+    if (value.includes('/ho-tro/') || value.includes('/kiem-tra-bao-hanh') || value.includes('hddt.') || value.includes('/ctkm/du-an-doanh-nghiep')) return false;
     if (value.includes('xem tat ca') || value.includes('chinh sach bao mat')) return false;
     if (value.includes('mobile.html') && !value.includes('khuyen-mai') && !value.includes('uu-dai') && !value.includes('livestream')) return false;
 
+    // Filter out FPT Shop non-event categories & product categories
+    if (/\/(?:dien-may|giai-tri|tin-fstudio|thu-thuat|game-app|for-gamers|video-hot|hoi-dap|tac-gia|san-pham|chu-de)(?:\/|$)/.test(value)) return false;
+    if (/\/(?:noi-lau-dien|may-ep-hoa-qua|binh-dun-nuoc|noi-com-dien|may-rua-bat|noi-chien-khong-dau|noi-ap-suat|chao-chong-dinh|phu-kien)\//.test(value)) return false;
+
     return /khuyen-mai|uu-dai|sale|livestream|ra-mat|mo-ban|su-kien|promotion|event|launch|campaign|flash-sale|giam-gia|hot-deal|voucher|thanh-toan|smember|sforum|tin-tuc|deal|giam|tang|quoc-khanh|flagship|chuong-trinh|mo-rong|tra-gop/.test(value);
+  }
+
+  private isNoiseTitle(title: string, url: string): boolean {
+    if (!title || title.trim().length < 8) return true;
+
+    const lower = title.trim().toLowerCase();
+    const normalized = this.normalizeText(title);
+
+    // 1. Rejection of code snippets, HTML tags, attributes, and URLs as titles
+    if (
+      lower.startsWith('http://') ||
+      lower.startsWith('https://') ||
+      lower.includes('data-element_type=') ||
+      lower.includes('speculationrules') ||
+      lower.includes('wp-content') ||
+      lower.includes('wp-includes') ||
+      lower.includes('wp content') ||
+      lower.includes('wp includes') ||
+      lower.includes('application/rss+xml') ||
+      lower.includes('<nav') ||
+      lower.includes('<div') ||
+      lower.includes('<script') ||
+      lower.includes('class=') ||
+      lower.includes('href=') ||
+      lower.includes('style=') ||
+      lower === 'description' ||
+      lower === 'tin tức' ||
+      lower === 'tin tuc'
+    ) {
+      return true;
+    }
+
+    // 2. Rejection of pure category labels or nav items without actual event title
+    if (
+      normalized === 'chua duoc phan loai' ||
+      normalized === 'uncategorized' ||
+      normalized === 'trang chu' ||
+      normalized === 'tin tuc cong nghe' ||
+      normalized === 'danh gia' ||
+      normalized === 'khuyen mai' ||
+      normalized === 'tin tuc' ||
+      normalized === 'laptop pc' ||
+      normalized === 'laptop & pc' ||
+      normalized.includes('dmca logo') ||
+      normalized.includes('logo sforum') ||
+      normalized.includes('chinh sach bao mat') ||
+      normalized.includes('thoa thuan cung cap') ||
+      normalized.includes('cau hoi thuong gap') ||
+      normalized.includes('huong dan mua hang') ||
+      normalized.includes('quy dinh ve ho tro') ||
+      normalized.includes('dai ly uy quyen') ||
+      normalized.includes('cac dieu kien') ||
+      normalized.includes('quy trinh giai quyet') ||
+      normalized.includes('tin tuc dien may') ||
+      normalized.includes('goc giai tri') ||
+      normalized.includes('tin tuc f studio') ||
+      normalized.includes('tin tuc fstudio') ||
+      normalized.includes('video danh gia') ||
+      normalized.includes('chuyen trang game') ||
+      normalized.includes('kien thuc doi song') ||
+      normalized.includes('thu thuat') ||
+      normalized.includes('gioi thieu ve cong ty') ||
+      normalized.includes('gioi thieu may doi tra') ||
+      normalized.includes('tra cuu hoa don') ||
+      normalized.includes('du an doanh nghiep') ||
+      normalized.includes('quy che hoat dong') ||
+      normalized.includes('thuong hieu dam bao') ||
+      normalized.includes('tra cuu bao hanh') ||
+      normalized.includes('tra cuu bang gia') ||
+      normalized.includes('danh sach nguoi co anh huong') ||
+      normalized === 'khong tim thay' ||
+      normalized.startsWith('luu tru') ||
+      normalized === 'gioi thieu' ||
+      normalized === 'home' ||
+      normalized === 'menu'
+    ) {
+      return true;
+    }
+
+    return false;
   }
 
   private isNoiseLink(url: string, title: string, contextText: string) {
     const combined = this.normalizeText(`${url} ${title} ${contextText}`);
     return (
       combined.startsWith('tel:') ||
-      combined.includes('1800.2063') ||
-      combined.includes('1800.2097') ||
+      /\b1[89]00[\s.-]?\d{4}\b/.test(combined) ||
       combined.includes('chinh sach bao mat') ||
       combined.includes('dang ky nhan tin') ||
       combined.includes('xem tat ca') ||
       combined.includes('dieu khoan') ||
       combined.includes('gioi thieu ve cong ty') ||
       combined.includes('gioi thieu cong ty') ||
+      combined.includes('gioi thieu may doi tra') ||
       combined.includes('quy che') ||
       combined.includes('cau hoi thuong gap') ||
       combined.includes('tra cuu') ||
@@ -1215,6 +1757,10 @@ export class CrawlerService {
       combined.includes('dai ly uy quyen') ||
       combined.includes('nguoi co anh huong') ||
       combined.includes('quy dinh ve') ||
+      combined.includes('/ho-tro/') ||
+      combined.includes('/kiem-tra-bao-hanh') ||
+      combined.includes('hddt.') ||
+      combined.includes('thuong hieu dam bao') ||
       (combined.includes('mobile.html') && !combined.includes('khuyen mai') && !combined.includes('uu dai'))
     );
   }
@@ -1248,90 +1794,7 @@ export class CrawlerService {
     );
   }
 
-  private parsePublishedDate(raw: string | null) {
-    if (!raw) return null;
-    const value = raw.trim();
-    if (!value) return null;
 
-    const direct = new Date(value);
-    if (!Number.isNaN(direct.getTime())) {
-      return { date: direct, time: direct.toTimeString().slice(0, 5) };
-    }
-
-    // Vietnamese month string: "Tháng 8 24, 2026" or "Tháng 08 24, 2026"
-    const vnMonthMatch = value.match(/tháng\s+(\d{1,2})\s+(\d{1,2}),?\s+(\d{4})/i);
-    if (vnMonthMatch) {
-      const [, month, day, year] = vnMonthMatch;
-      const date = new Date(Number(year), Number(month) - 1, Number(day), 9, 0);
-      if (!Number.isNaN(date.getTime())) return { date, time: '09:00' };
-    }
-
-    // Vietnamese day-month-year string: "24 Tháng 8, 2026" or "24/08/2026"
-    const vnDayMatch = value.match(/(\d{1,2})\s+(?:tháng\s+)?(\d{1,2}),?\s+(\d{4})/i);
-    if (vnDayMatch) {
-      const [, day, month, year] = vnDayMatch;
-      const date = new Date(Number(year), Number(month) - 1, Number(day), 9, 0);
-      if (!Number.isNaN(date.getTime())) return { date, time: '09:00' };
-    }
-
-    const parts = value.match(/(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{2,4})(?:\s+(\d{1,2}):(\d{2}))?/);
-    if (parts) {
-      const [, day, month, yearValue, hour = '00', minute = '00'] = parts;
-      const year = Number(yearValue.length === 2 ? `20${yearValue}` : yearValue);
-      const date = new Date(year, Number(month) - 1, Number(day), Number(hour), Number(minute));
-      if (!Number.isNaN(date.getTime())) return { date, time: `${hour.padStart(2, '0')}:${minute.padStart(2, '0')}` };
-    }
-
-    // Vietnamese relative time patterns: "2 giờ trước", "1 ngày trước", "3 ngày trước"
-    const relativeMatch = value.match(/(\d+)\s*(phút|giờ|ngày|tuần)\s*(trước|sau)/i);
-    if (relativeMatch) {
-      const [, count, unit, direction] = relativeMatch;
-      const n = Number(count);
-      const now = new Date();
-      const date = new Date(now.getTime());
-      if (direction === 'trước') {
-        if (unit.toLowerCase().includes('phút')) date.setMinutes(date.getMinutes() - n);
-        else if (unit.toLowerCase().includes('giờ')) date.setHours(date.getHours() - n);
-        else if (unit.toLowerCase().includes('ngày')) date.setDate(date.getDate() - n);
-        else if (unit.toLowerCase().includes('tuần')) date.setDate(date.getDate() - n * 7);
-      } else {
-        if (unit.toLowerCase().includes('phút')) date.setMinutes(date.getMinutes() + n);
-        else if (unit.toLowerCase().includes('giờ')) date.setHours(date.getHours() + n);
-        else if (unit.toLowerCase().includes('ngày')) date.setDate(date.getDate() + n);
-        else if (unit.toLowerCase().includes('tuần')) date.setDate(date.getDate() + n * 7);
-      }
-      return { date, time: date.toTimeString().slice(0, 5) };
-    }
-
-    // Time range patterns: "8:00 - 21:30", "8h - 21h30", "8:00-21:30"
-    const rangeMatch = value.match(/(\d{1,2})[:hH](\d{2})?\s*[-–—]\s*(\d{1,2})[:hH](\d{2})?/);
-    if (rangeMatch) {
-      const [, hour1, minute1 = '00', hour2, minute2 = '00'] = rangeMatch;
-      const time1 = `${hour1.padStart(2, '0')}:${minute1}`;
-      const time2 = `${hour2.padStart(2, '0')}:${minute2}`;
-      return { date: null, time: time1, endTime: time2 };
-    }
-
-    const timeParts = value.match(/\b(\d{1,2}):(\d{2})\b/);
-    if (timeParts) {
-      const hour = Number(timeParts[1]);
-      if (hour >= 0 && hour <= 23) {
-        return { date: null, time: `${timeParts[1].padStart(2, '0')}:${timeParts[2]}` };
-      }
-    }
-
-    // Vietnamese hour format: "8h", "8h30", "21h00", "9 giờ 30 phút"
-    const vnTimeMatch = value.match(/(\d{1,2})\s*(?:h|giờ)\s*(\d{1,2})?\s*(?:phút)?/i);
-    if (vnTimeMatch) {
-      const hour = Number(vnTimeMatch[1]);
-      if (hour >= 0 && hour <= 23) {
-        const minute = vnTimeMatch[2] || '00';
-        return { date: null, time: `${String(hour).padStart(2, '0')}:${minute.padStart(2, '0')}` };
-      }
-    }
-
-    return null;
-  }
 
   private normalizeUrl(rawUrl?: string | null): string {
     if (!rawUrl) return '';
@@ -1379,15 +1842,21 @@ export class CrawlerService {
   }
 
   private formatTelegramMessage(event: Event) {
+    const formattedDate = event.eventDate
+      ? new Date(event.eventDate).toLocaleDateString('vi-VN', {
+          day: '2-digit',
+          month: '2-digit',
+          year: 'numeric',
+        })
+      : '';
+
     const lines = [
-      '<b>Su kien doi thu moi</b>',
-      `<b>${this.escapeHtml(event.sourceName)}</b>`,
-      '',
-      this.escapeHtml(event.title),
-      '',
-      `Loai: ${this.escapeHtml(this.getEventTypeLabel(event.type))}`,
-      event.eventDate ? `Thoi gian: ${event.eventDate.toISOString()}` : '',
-      `Link: ${this.escapeHtml(event.url)}`,
+      '<b>🔔 SỰ KIỆN ĐỐI THỦ MỚI</b>',
+      `<b>Thương hiệu:</b> ${this.escapeHtml(event.sourceName)}`,
+      `<b>Tiêu đề:</b> ${this.escapeHtml(event.title)}`,
+      `<b>Loại sự kiện:</b> ${this.escapeHtml(this.getEventTypeLabel(event.type))}`,
+      formattedDate ? `<b>Thời gian:</b> ${formattedDate}` : '',
+      `<b>Chi tiết:</b> ${this.escapeHtml(event.url)}`,
     ];
 
     return lines.filter(Boolean).join('\n');

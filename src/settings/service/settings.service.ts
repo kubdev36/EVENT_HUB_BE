@@ -34,7 +34,11 @@ const DEFAULT_CRAWLER_SOURCES = [
     logo: '/img/cellphones.png',
     enabled: true,
     interval: '6h',
-    targetUrls: ['https://cellphones.com.vn/sforum/khuyen-mai-soc'],
+    targetUrls: [
+      'https://cellphones.com.vn/sforum/khuyen-mai',
+      'https://cellphones.com.vn/sforum/tin-tuc',
+      'https://cellphones.com.vn/sforum/feed',
+    ],
   },
   {
     id: 'hoangha',
@@ -73,15 +77,19 @@ const DEFAULT_CRAWLER_SOURCES = [
       'https://www.thegioididong.com/tin-tuc/danh-gia/210',
       'https://www.thegioididong.com/tin-tuc/laptop/1269',
     ],
+    ajaxEndpoint: 'https://www.thegioididong.com/tin-tuc/aj/Home/Box',
+    ajaxPayload: 'ID=1169&Size=10&Index={page}',
   },
   {
-    id: 'nguyenkim',
-    name: 'Nguyễn Kim',
+    id: 'viettelstore',
+    name: 'Viettel Store',
     type: 'web',
-    logo: '/img/nguyenkim.png',
+    logo: '/img/viettel.png',
     enabled: true,
     interval: '6h',
-    targetUrls: ['https://www.nguyenkim.com/khuyen-mai.html'],
+    targetUrls: ['https://viettelstore.vn/chuyen-muc-tin/tin-khuyen-mai'],
+    ajaxEndpoint: 'https://viettelstore.vn/AjaxAction.aspx',
+    ajaxPayload: 'action=get-news-rest-api-theme-5&slug={slug}&keyword=&pageSize=15&currentPage={page}&specOrder=DESC&topNews=0',
   },
 ];
 
@@ -112,43 +120,6 @@ export class SettingsService implements OnModuleInit {
       const crawlerSetting = await this.settingRepository.findOne({ where: { key: 'crawler_sources' } });
       if (!crawlerSetting || !Array.isArray(crawlerSetting.value) || crawlerSetting.value.length === 0) {
         await this.saveSetting('crawler_sources', DEFAULT_CRAWLER_SOURCES);
-      } else if (Array.isArray(crawlerSetting.value)) {
-        let modified = false;
-        const updated = crawlerSetting.value.map((src: any) => {
-          if (src.id === 'cellphones' && src.targetUrls?.[0] !== 'https://cellphones.com.vn/sforum/khuyen-mai-soc') {
-            modified = true;
-            return { ...src, targetUrls: ['https://cellphones.com.vn/sforum/khuyen-mai-soc'] };
-          }
-          if (src.id === 'fptshop') {
-            modified = true;
-            return {
-              ...src,
-              targetUrls: [
-                'https://fptshop.com.vn/tin-tuc/tin-khuyen-mai',
-                'https://fptshop.com.vn/tin-tuc/tin-moi',
-                'https://fptshop.com.vn/tin-tuc/danh-gia',
-                'https://fptshop.com.vn/tin-tuc/dien-may',
-                'https://fptshop.com.vn/tin-tuc/tin-fstudio',
-              ],
-            };
-          }
-          if (src.id === 'tgdd') {
-            modified = true;
-            return {
-              ...src,
-              targetUrls: [
-                'https://www.thegioididong.com/tin-tuc',
-                'https://www.thegioididong.com/tin-tuc/tin-khuyen-mai/31',
-                'https://www.thegioididong.com/tin-tuc/danh-gia/210',
-                'https://www.thegioididong.com/tin-tuc/laptop/1269',
-              ],
-            };
-          }
-          return src;
-        });
-        if (modified) {
-          await this.saveSetting('crawler_sources', updated);
-        }
       }
 
       const keywordSetting = await this.settingRepository.findOne({ where: { key: 'keyword_rules' } });

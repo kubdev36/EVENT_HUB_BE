@@ -3,6 +3,11 @@ import { Column, CreateDateColumn, Entity, Index, PrimaryGeneratedColumn, Update
 @Entity('events')
 @Index(['sourceUrl', 'url'], { unique: true })
 @Index(['contentHash'], { unique: true })
+@Index(['eventDate'])
+@Index(['sourceId'])
+@Index(['type'])
+@Index(['origin'])
+@Index(['sourceId', 'eventDate'])
 export class Event {
   @PrimaryGeneratedColumn('uuid')
   id: string;

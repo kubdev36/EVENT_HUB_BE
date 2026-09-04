@@ -12,6 +12,9 @@ export type CrawlSource = {
   enabled?: boolean;
   interval?: string;
   targetUrls: string[];
+  ajaxEndpoint?: string;
+  ajaxPayload?: string;
+  paginationType?: string;
 };
 
 export type CrawlTarget = CrawlSource & {

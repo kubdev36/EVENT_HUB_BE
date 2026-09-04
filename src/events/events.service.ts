@@ -220,6 +220,10 @@ export class EventsService {
   }
 
   private resolveLogo(id: string, name: string, currentLogo?: string | null): string {
+    if (currentLogo && currentLogo.trim().length > 0) {
+      return currentLogo;
+    }
+
     const sId = (id || '').toLowerCase().trim();
     const sName = (name || '').toLowerCase().trim();
 
@@ -229,10 +233,6 @@ export class EventsService {
     if (sId.includes('fpt') || sName.includes('fpt')) return '/img/fpt.png';
     if (sId.includes('tgdd') || sId.includes('thegioididong') || sName.includes('thế giới di động') || sName.includes('the gioi di dong')) return '/img/tgdd.jpg';
     if (sId.includes('nguyenkim') || sName.includes('nguyễn kim') || sName.includes('nguyen kim')) return '/img/nguyenkim.png';
-
-    if (currentLogo && (currentLogo.startsWith('/img/') || currentLogo.startsWith('data:'))) {
-      return currentLogo;
-    }
 
     return '/img/mtm.jpg';
   }
