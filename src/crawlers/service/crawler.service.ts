@@ -68,7 +68,8 @@ export class CrawlerService {
       let newItems = 0;
 
       for (const item of items) {
-        const itemKey = `${item.url}|${this.normalizeText(item.title)}`;
+        const cleanUrl = this.normalizeUrl(item.url);
+        const itemKey = `${cleanUrl}|${this.normalizeText(item.title)}`;
         if (seen.has(itemKey)) continue;
         seen.add(itemKey);
 
@@ -80,7 +81,6 @@ export class CrawlerService {
           existing.title = item.title;
           existing.description = item.description ?? existing.description;
           existing.image = item.image ?? existing.image;
-          existing.eventDate = item.eventDate ?? existing.eventDate;
           existing.eventTime = item.eventTime ?? existing.eventTime;
           existing.rawData = item.rawData ?? existing.rawData;
           existing.type = type;
@@ -731,32 +731,47 @@ export class CrawlerService {
   }
 
   private async findExistingEvent(target: CrawlTarget, item: ParsedCrawlItem) {
+    const cleanUrl = this.normalizeUrl(item.url);
+    const hash = this.buildContentHash(target.id, item.url, item.title);
+
+    // 1. Check exact contentHash
+    const byHash = await this.eventRepository.findOne({
+      where: { sourceId: target.id, contentHash: hash },
+    });
+    if (byHash) return byHash;
+
+    // 2. Check exact URL
     const byUrl = await this.eventRepository.findOne({
       where: { sourceId: target.id, url: item.url },
     });
     if (byUrl) return byUrl;
 
-    const byHash = await this.eventRepository.findOne({
-      where: {
-        sourceId: target.id,
-        contentHash: this.buildContentHash(target.id, item.url, item.title, item.description || ''),
-      },
-    });
-    if (byHash) return byHash;
-
+    // 3. Search in latest events for matching normalized URL or high title similarity
     const latest = await this.eventRepository.find({
       where: { sourceId: target.id },
       order: { createdAt: 'DESC' },
-      take: 200,
+      take: 500,
     });
 
-    return latest.find((event) => event.url === item.url && this.titleSimilarity(event.title, item.title) >= 0.75) || null;
+    const normTitle = this.normalizeText(item.title);
+    return (
+      latest.find((event) => {
+        const evCleanUrl = this.normalizeUrl(event.url);
+        if (evCleanUrl && cleanUrl && evCleanUrl === cleanUrl) return true;
+
+        const evNormTitle = this.normalizeText(event.title);
+        if (evNormTitle && normTitle && evNormTitle === normTitle) return true;
+
+        return this.titleSimilarity(event.title, item.title) >= 0.70;
+      }) || null
+    );
   }
 
   private async createOrMergeEvent(target: CrawlTarget, item: ParsedCrawlItem, type: string) {
     const now = new Date();
-    const currentCrawlTime = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
-    const eventTime = item.eventTime || currentCrawlTime;
+    item.title = this.cleanTitle(item.title);
+    const parsedDateInfo = this.parseItemEventDate(item, now);
+    const contentHash = this.buildContentHash(target.id, item.url, item.title);
 
     const payload = this.eventRepository.create({
       sourceId: target.id,
@@ -767,11 +782,11 @@ export class CrawlerService {
       description: item.description ?? null,
       image: item.image ?? null,
       url: item.url,
-      eventDate: now,
-      eventTime,
+      eventDate: parsedDateInfo.date,
+      eventTime: parsedDateInfo.time,
       type,
       rawData: item.rawData ?? null,
-      contentHash: this.buildContentHash(target.id, item.url, item.title, item.description || ''),
+      contentHash,
       firstSeenAt: now,
       lastSeenAt: now,
       notifiedAt: null,
@@ -790,11 +805,10 @@ export class CrawlerService {
 
         if (existing) {
           existing.lastSeenAt = now;
-          existing.eventDate = now;
           existing.title = item.title;
           existing.description = item.description ?? existing.description;
           existing.image = item.image ?? existing.image;
-          existing.eventTime = existing.eventTime || eventTime;
+          existing.eventTime = existing.eventTime || parsedDateInfo.time;
           existing.rawData = item.rawData ?? existing.rawData;
           existing.type = type;
           return this.eventRepository.save(existing);
@@ -974,6 +988,7 @@ export class CrawlerService {
       .filter(Boolean);
 
     for (const item of items) {
+      if (item.title) item.title = this.cleanTitle(item.title);
       if (!item.title || !item.url) continue;
 
       if (targetDomains.length > 0) {
@@ -1084,6 +1099,89 @@ export class CrawlerService {
     }
   }
 
+  private cleanTitle(rawTitle: string): string {
+    if (!rawTitle) return '';
+    let title = rawTitle.replace(/\s+/g, ' ').trim();
+
+    // 1. Precise match: Author name (1-3 capitalized words) + Date (DD/MM) or Relative Time (X giờ trước / X tuần trước)
+    title = title.replace(/\s+([A-Z\u00C0-\u024F][a-z\u00C0-\u024F]+\s+){1,3}(?:\d{1,2}[\/.-]\d{1,2}(?:[\/.-]\d{2,4})?|\d+\s*(?:giờ|ngày|phút|tuần)\s*(?:trước|sau))$/u, '');
+
+    // 2. Standalone relative time at end: e.g. " 13 giờ trước", " 1 tuần trước"
+    title = title.replace(/\s+\d+\s*(?:giờ|ngày|phút|tuần)\s*(?:trước|sau)$/u, '');
+
+    // 3. Remove brand site suffixes
+    title = title
+      .replace(/\s*-\s*Thegioididong\.com.*$/i, '')
+      .replace(/\s*-\s*Fptshop.*$/i, '')
+      .replace(/\s*-\s*CellphoneS.*$/i, '');
+
+    return title.trim();
+  }
+
+  private parseItemEventDate(item: ParsedCrawlItem, referenceDate: Date = new Date()): { date: Date; time: string } {
+    const text = `${item.title} ${item.description || ''}`.trim();
+    const url = item.url || '';
+
+    if (item.eventDate && !isNaN(item.eventDate.getTime())) {
+      const isDummyNow = Math.abs(item.eventDate.getTime() - referenceDate.getTime()) < 5000;
+      if (!isDummyNow) {
+        const timeStr = item.eventTime || `${String(item.eventDate.getHours()).padStart(2, '0')}:${String(item.eventDate.getMinutes()).padStart(2, '0')}`;
+        return { date: item.eventDate, time: timeStr };
+      }
+    }
+
+    const relMatch = text.match(/(\d+)\s*(phút|giờ|ngày|tuần)\s*(trước|sau)/i);
+    if (relMatch) {
+      const [, countStr, unit, direction] = relMatch;
+      const n = parseInt(countStr, 10);
+      const d = new Date(referenceDate.getTime());
+      if (direction.toLowerCase() === 'trước') {
+        if (unit.toLowerCase().includes('phút')) d.setMinutes(d.getMinutes() - n);
+        else if (unit.toLowerCase().includes('giờ')) d.setHours(d.getHours() - n);
+        else if (unit.toLowerCase().includes('ngày')) d.setDate(d.getDate() - n);
+        else if (unit.toLowerCase().includes('tuần')) d.setDate(d.getDate() - n * 7);
+      }
+      const timeStr = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+      return { date: d, time: timeStr };
+    }
+
+    const urlDateMatch = url.match(/[\/._-](202\d)[\/._-]?(0[1-9]|1[0-2])[\/._-]?([0-2][1-9]|3[01])[\/._-]/);
+    if (urlDateMatch) {
+      const [, y, m, day] = urlDateMatch;
+      const d = new Date(parseInt(y, 10), parseInt(m, 10) - 1, parseInt(day, 10), 9, 0);
+      return { date: d, time: '09:00' };
+    }
+
+    const vnTextDateMatch = text.match(/ngày\s+(\d{1,2})\s+tháng\s+(\d{1,2})(?:\s+năm\s+(\d{4}))?/i);
+    if (vnTextDateMatch) {
+      const [, dayStr, monthStr, yearStr] = vnTextDateMatch;
+      const day = parseInt(dayStr, 10);
+      const month = parseInt(monthStr, 10);
+      const year = yearStr ? parseInt(yearStr, 10) : referenceDate.getFullYear();
+      const d = new Date(year, month - 1, day, 9, 0);
+      return { date: d, time: '09:00' };
+    }
+
+    const explicitDateMatch = text.match(/(?:ngày\s+)?(\d{1,2})(?:\s*[-–—]\s*\d{1,2})?[\/.-](\d{1,2})(?:[\/.-](\d{2,4}))?/i);
+    if (explicitDateMatch) {
+      const [, dayStr, monthStr, yearStr] = explicitDateMatch;
+      const day = parseInt(dayStr, 10);
+      const month = parseInt(monthStr, 10);
+      if (day >= 1 && day <= 31 && month >= 1 && month <= 12) {
+        const currentYear = referenceDate.getFullYear();
+        let year = yearStr ? parseInt(yearStr.length === 2 ? '20' + yearStr : yearStr, 10) : currentYear;
+        const d = new Date(year, month - 1, day, 9, 0);
+        const diffDays = Math.abs((d.getTime() - referenceDate.getTime()) / (1000 * 3600 * 24));
+        if (diffDays < 180) {
+          return { date: d, time: '09:00' };
+        }
+      }
+    }
+
+    const defaultTime = item.eventTime || `${String(referenceDate.getHours()).padStart(2, '0')}:${String(referenceDate.getMinutes()).padStart(2, '0')}`;
+    return { date: referenceDate, time: defaultTime };
+  }
+
   private isLikelyEventUrl(url: string) {
     const value = this.normalizeText(url);
     if (!value) return false;
@@ -1160,6 +1258,22 @@ export class CrawlerService {
       return { date: direct, time: direct.toTimeString().slice(0, 5) };
     }
 
+    // Vietnamese month string: "Tháng 8 24, 2026" or "Tháng 08 24, 2026"
+    const vnMonthMatch = value.match(/tháng\s+(\d{1,2})\s+(\d{1,2}),?\s+(\d{4})/i);
+    if (vnMonthMatch) {
+      const [, month, day, year] = vnMonthMatch;
+      const date = new Date(Number(year), Number(month) - 1, Number(day), 9, 0);
+      if (!Number.isNaN(date.getTime())) return { date, time: '09:00' };
+    }
+
+    // Vietnamese day-month-year string: "24 Tháng 8, 2026" or "24/08/2026"
+    const vnDayMatch = value.match(/(\d{1,2})\s+(?:tháng\s+)?(\d{1,2}),?\s+(\d{4})/i);
+    if (vnDayMatch) {
+      const [, day, month, year] = vnDayMatch;
+      const date = new Date(Number(year), Number(month) - 1, Number(day), 9, 0);
+      if (!Number.isNaN(date.getTime())) return { date, time: '09:00' };
+    }
+
     const parts = value.match(/(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{2,4})(?:\s+(\d{1,2}):(\d{2}))?/);
     if (parts) {
       const [, day, month, yearValue, hour = '00', minute = '00'] = parts;
@@ -1219,8 +1333,30 @@ export class CrawlerService {
     return null;
   }
 
-  private buildContentHash(sourceId: string, url: string, title: string, description: string) {
-    return createHash('sha256').update(`${sourceId}|${url}|${title}|${description}`).digest('hex');
+  private normalizeUrl(rawUrl?: string | null): string {
+    if (!rawUrl) return '';
+    try {
+      const parsed = new URL(rawUrl);
+      const trackingParams = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content', 'fbclid', 'gclid', 'spm', 'ref'];
+      trackingParams.forEach((param) => parsed.searchParams.delete(param));
+
+      let clean = `${parsed.origin}${parsed.pathname}`;
+      if (clean.endsWith('/') && clean.length > 8) {
+        clean = clean.slice(0, -1);
+      }
+      if (parsed.search) {
+        clean += parsed.search;
+      }
+      return clean.toLowerCase();
+    } catch {
+      return (rawUrl || '').trim().toLowerCase().replace(/\/$/, '');
+    }
+  }
+
+  private buildContentHash(sourceId: string, url: string, title: string) {
+    const cleanUrl = this.normalizeUrl(url);
+    const cleanTitle = this.normalizeText(title);
+    return createHash('sha256').update(`${sourceId}|${cleanUrl}|${cleanTitle}`).digest('hex');
   }
 
   private isDuplicateKeyError(error: unknown) {
@@ -1259,11 +1395,14 @@ export class CrawlerService {
 
   private getEventTypeLabel(type: string) {
     const labels: Record<string, string> = {
-      release: 'Ra mat / Mo ban',
-      sale: 'Khuyen mai',
+      release: 'Ra mắt / Mở bán',
+      promo: 'Khuyến mãi',
+      sale: 'Khuyến mãi',
+      live: 'Livestream',
       livestream: 'Livestream',
-      ads: 'Quang cao',
-      other: 'Khac',
+      ads: 'Quảng cáo',
+      internal: 'Sự kiện nội bộ',
+      other: 'Khác',
     };
 
     return labels[type] || type;

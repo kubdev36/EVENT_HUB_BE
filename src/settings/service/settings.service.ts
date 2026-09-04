@@ -4,10 +4,18 @@ import { Repository } from 'typeorm';
 import { CrawlSource, CrawlTarget } from '../../crawlers/crawler.types.js';
 import { Setting } from '../entity/setting.entity.js';
 
-type SettingsKey = 'crawler_sources' | 'telegram_config' | 'keyword_rules';
+type SettingsKey = 'crawler_sources' | 'telegram_config' | 'keyword_rules' | 'department_rules';
 type CrawlerSourcesSetting =
   | { targets?: Array<Record<string, unknown>>; sources?: Array<Record<string, unknown>> }
   | Array<Record<string, unknown>>;
+
+const DEFAULT_DEPARTMENT_RULES = [
+  { type: 'promo', label: 'Khuyến mãi', departments: ['mkt', 'kinh_doanh'] },
+  { type: 'release', label: 'Ra mắt / Mở bán', departments: ['mkt'] },
+  { type: 'live', label: 'Livestream', departments: ['kinh_doanh'] },
+  { type: 'ads', label: 'Quảng cáo', departments: ['mkt'] },
+  { type: 'other', label: 'Khác', departments: ['mkt', 'kinh_doanh'] },
+];
 
 const DEFAULT_CRAWLER_SOURCES = [
   {
@@ -78,18 +86,21 @@ const DEFAULT_CRAWLER_SOURCES = [
 ];
 
 const DEFAULT_KEYWORD_RULES = [
-  { type: 'promo', label: 'Khuyến mãi', keywords: 'khuyen mai, uu dai, giam gia, flash sale, khuyen mai soc, giam gia khung' },
-  { type: 'release', label: 'Ra mắt sản phẩm', keywords: 'ra mat, mo ban, launch, unbox, gioi thieu, san pham moi, pre-order' },
+  { type: 'promo', label: 'Khuyến mãi', keywords: 'sale, giam gia, uu dai, khuyen mai, flash sale, deal, gia soc' },
+  { type: 'release', label: 'Ra mắt / Mở bán', keywords: 'ra mat, mo ban, launch, unbox, gioi thieu, san pham moi, pre-order' },
   { type: 'live', label: 'Livestream', keywords: 'livestream, live, phat truc tiep, xem live, san deal live' },
   { type: 'ads', label: 'Quảng cáo', keywords: 'quang cao, ads, banner, truyen thong, partner' },
-  { type: 'internal', label: 'Sự kiện nội bộ', keywords: 'noi bo, minhtuanmobile, event noi bo, mtm' },
+  { type: 'other', label: 'Khác', keywords: 'khac, other, tin tuc, danh gia' },
 ];
+
+import { TelegramConfig, TelegramService } from '../../telegram/telegram.service.js';
 
 @Injectable()
 export class SettingsService implements OnModuleInit {
   constructor(
     @InjectRepository(Setting)
     private readonly settingRepository: Repository<Setting>,
+    private readonly telegramService: TelegramService,
   ) {}
 
   async onModuleInit() {
@@ -141,8 +152,20 @@ export class SettingsService implements OnModuleInit {
       }
 
       const keywordSetting = await this.settingRepository.findOne({ where: { key: 'keyword_rules' } });
-      if (!keywordSetting || !Array.isArray(keywordSetting.value) || keywordSetting.value.length === 0) {
+      if (
+        !keywordSetting ||
+        !Array.isArray(keywordSetting.value) ||
+        keywordSetting.value.length < 4 ||
+        (keywordSetting.value as Array<{ label?: string; type?: string }>).some(
+          (item) => item.type === 'internal' || (item.label && item.label.includes('(')),
+        )
+      ) {
         await this.saveSetting('keyword_rules', DEFAULT_KEYWORD_RULES);
+      }
+
+      const deptSetting = await this.settingRepository.findOne({ where: { key: 'department_rules' } });
+      if (!deptSetting || !Array.isArray(deptSetting.value) || deptSetting.value.length === 0) {
+        await this.saveSetting('department_rules', DEFAULT_DEPARTMENT_RULES);
       }
     } catch {
       // Ignore initial DB connection timing errors during migrations
@@ -178,9 +201,13 @@ export class SettingsService implements OnModuleInit {
   }
 
   async testTelegramMessage(data: unknown) {
+    const config = data as TelegramConfig;
+    const testMessage = '<b>[Event Hub] Tin nhắn thử nghiệm Telegram Bot!</b>\nCấu hình Bot Token và Chat ID đã kết nối thành công!';
+    const result = await this.telegramService.sendMessage(testMessage, config);
+
     return {
-      message: 'Telegram configuration received',
-      data,
+      message: result.ok ? 'Đã gửi tin nhắn thử nghiệm Telegram thành công.' : `Kiểm tra Telegram thất bại: ${result.description || result.message || 'Lỗi không xác định'}`,
+      result,
     };
   }
 
@@ -206,6 +233,10 @@ export class SettingsService implements OnModuleInit {
     }
 
     if (key === 'keyword_rules' && this.hasArrayProperty(value, 'rules')) {
+      return value.rules;
+    }
+
+    if (key === 'department_rules' && this.hasArrayProperty(value, 'rules')) {
       return value.rules;
     }
 

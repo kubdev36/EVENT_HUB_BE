@@ -155,6 +155,13 @@ export class SettingsController {
     return this.settingsService.saveSetting('keyword_rules', data);
   }
 
+  @Post('departments')
+  @Roles(Role.ADMIN)
+  @ApiOperation({ summary: 'Save department rules' })
+  async updateDepartments(@Body() data: any) {
+    return this.settingsService.saveSetting('department_rules', data);
+  }
+
   @Post('crawler/run')
   @Roles(Role.ADMIN, Role.STAFF)
   @ApiOperation({ summary: 'Run one crawler target by body id' })
